@@ -1,0 +1,10 @@
+{
+  "baseURL": "https://api.topstepx.com",
+  "userName": "YOUR_TOPSTEPX_USERNAME",
+  "apiKey": "YOUR_PROJECTX_API_KEY",
+  "readOnly": true,
+  "leadAccountId": null,
+  "accountSize": "50K",
+  "localDailyMaxLoss": 500,
+  "localDailyProfitTarget": 800
+}

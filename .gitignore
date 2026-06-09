@@ -1,0 +1,23 @@
+.DS_Store
+
+# Local credentials and runtime config
+topstepx_config.json
+**/topstepx_config.json
+!**/topstepx_config.example.json
+*.local.json
+*.secret.json
+
+# Build outputs
+*.app/
+outputs/*.app/
+outputs/TopstepXFloatPanel
+outputs/TopstepXFloatPanel-*
+outputs/topstepx_float_panel
+
+# Logs and temporary files
+*.log
+*.tmp
+archive/
+DerivedData/
+.build/
+
