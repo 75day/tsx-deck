@@ -1,8 +1,18 @@
 # TSX Deck
 
-TSX Deck is a native macOS floating trading panel for TopstepX / ProjectX Gateway API. It is designed for fast futures order entry with live quotes, account status, market and limit tickets, optional TP/SL bracket submission, working-order controls, and connection status visibility.
+TSX Deck is a native macOS floating trading panel for the TopstepX / ProjectX Gateway API. It is designed for fast futures order entry with live quotes, account status, market and limit tickets, optional TP/SL bracket submission, working-order controls, and connection status visibility.
 
 This project is unofficial and is not affiliated with, endorsed by, or sponsored by Topstep, TopstepX, or ProjectX.
+
+**Keywords:** TopstepX, ProjectX Gateway API, macOS trading panel, futures trading, NQ, MNQ, ES, MES, market order, limit order, OCO bracket, TP/SL, AppKit.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/assets/tsx-deck-dark-market.png" alt="TSX Deck dark mode market order panel with live futures quote, account status, and order controls" width="31%">
+  <img src="docs/assets/tsx-deck-light-ticket.png" alt="TSX Deck light mode floating futures trading ticket with market order controls and working orders" width="31%">
+  <img src="docs/assets/tsx-deck-dark-limit.png" alt="TSX Deck dark mode limit order ticket with price input, quantity controls, and TP SL options" width="31%">
+</p>
 
 ## Status
 
@@ -18,6 +28,13 @@ This is an active personal trading tool. Treat it as experimental software. Alwa
 - Account, position, average price, realized P&L, unrealized P&L, and connection status display when returned by the API.
 - Bundled order and TP sound alerts.
 - Example configuration only; real credentials are loaded from local Application Support.
+
+## Use Cases
+
+- Fast discretionary futures execution from a compact always-on-top macOS panel.
+- Monitoring TopstepX / ProjectX account status, current position, working orders, and API connectivity.
+- Sending simple market and limit orders with optional official TP/SL bracket behavior.
+- Keeping real API credentials outside the repository while shipping a reproducible open-source build.
 
 ## Requirements
 
@@ -181,4 +198,3 @@ cp outputs/topstepx_config.example.json "$HOME/Library/Application Support/Topst
 期货交易风险极高，可能造成重大亏损。开启 live 模式后，本软件可以发送真实订单。交易前请自行确认账户、商品、数量、方向、订单类型、价格、TP/SL 和官方平台状态。
 
 不要把真实 `topstepx_config.json`、API Key、账户密钥、包含 token 的日志或带本地配置的打包产物提交到 GitHub。
-
