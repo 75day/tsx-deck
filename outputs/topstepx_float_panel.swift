@@ -1672,6 +1672,8 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         stylePopup(account)
         account.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
         account.fixedWidth(accountPopupWidth(selectedAccountTitle, font: account.font ?? NSFont.systemFont(ofSize: 10, weight: .semibold)))
+        styleAccountPopupMenu(account, titles: titlesForAccountPopup(account), selectedIndex: account.indexOfSelectedItem)
+        account.title = selectedAccountTitle
         top.addArrangedSubview(account)
         top.addArrangedSubview(spacer())
 
@@ -4920,6 +4922,33 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     func accountPopupWidth(_ value: String, font: NSFont) -> CGFloat {
         let textWidth = (value as NSString).size(withAttributes: [.font: font]).width
         return min(max(ceil(textWidth + 32), 96), 138)
+    }
+
+    func titlesForAccountPopup(_ popup: NSPopUpButton) -> [String] {
+        return popup.itemArray.map { $0.title }
+    }
+
+    func accountMenuDisplayTitle(_ value: String) -> String {
+        let compact = value.replacingOccurrences(of: "-219616-", with: "-")
+        guard compact.count > 25 else { return compact }
+        return String(compact.prefix(21)) + "..."
+    }
+
+    func styleAccountPopupMenu(_ popup: NSPopUpButton, titles: [String], selectedIndex: Int) {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: palette.text,
+            .paragraphStyle: paragraph
+        ]
+        for (index, item) in popup.itemArray.enumerated() {
+            let baseTitle = titles.indices.contains(index) ? titles[index] : item.title
+            let check = index == selectedIndex ? "✓ " : "  "
+            item.state = .off
+            item.attributedTitle = NSAttributedString(string: check + accountMenuDisplayTitle(baseTitle), attributes: attrs)
+        }
     }
 
     func stylePopup(_ popup: NSPopUpButton) {
