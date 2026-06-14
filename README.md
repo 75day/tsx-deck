@@ -9,9 +9,10 @@ This project is unofficial and is not affiliated with, endorsed by, or sponsored
 ## Screenshots
 
 <p align="center">
-  <img src="docs/assets/tsx-deck-dark-market.png" alt="TSX Deck dark mode market order panel with live futures quote, account status, and order controls" width="31%">
-  <img src="docs/assets/tsx-deck-light-ticket.png" alt="TSX Deck light mode floating futures trading ticket with market order controls and working orders" width="31%">
-  <img src="docs/assets/tsx-deck-dark-limit.png" alt="TSX Deck dark mode limit order ticket with price input, quantity controls, and TP SL options" width="31%">
+  <img src="docs/assets/tsx-deck-dark-market.png" alt="TSX Deck dark mode market order panel with live futures quote, account status, working orders, and connection footer" width="24%">
+  <img src="docs/assets/tsx-deck-dark-limit.png" alt="TSX Deck dark mode limit order ticket with inline limit price input, quantity controls, and TP SL cards" width="24%">
+  <img src="docs/assets/tsx-deck-light-market.png" alt="TSX Deck light mode market order panel with compact native macOS trading controls" width="24%">
+  <img src="docs/assets/tsx-deck-light-limit.png" alt="TSX Deck light mode limit order ticket with bracket controls and working orders panel" width="24%">
 </p>
 
 ## Status
@@ -28,6 +29,14 @@ This is an active personal trading tool. Treat it as experimental software. Alwa
 - Account, position, average price, realized P&L, unrealized P&L, and connection status display when returned by the API.
 - Bundled order and TP sound alerts.
 - Example configuration only; real credentials are loaded from local Application Support.
+
+## Latest UI Refinements
+
+- Refined Market / Limit segmented control for a cleaner professional order-ticket flow.
+- Reworked Limit ticket layout with inline limit price stepping, compact quantity controls, and clearer TP / SL cards.
+- Improved Working Orders with a compact data-source pill, centered loading and empty states, and scroll-position preservation.
+- Added a cleaner footer health strip for API, stream, and market status without changing trading logic.
+- Kept the native panel width stable while allowing height to adapt to the active ticket and order list.
 
 ## Use Cases
 
@@ -58,7 +67,7 @@ chmod +x build_app.sh
 open "TSX Deck.app"
 ```
 
-The build script creates a universal macOS app and signs it ad hoc with hardened runtime. It bundles only `topstepx_config.example.json` as the app resource config.
+The build script creates a universal macOS app and signs it ad hoc with hardened runtime. By default it bundles the safe example config. For a private portable build on your own Macs, you may place a real `topstepx_config.json` beside `outputs/build_app.sh`; the script will bundle that local file into the generated app, while `.gitignore` keeps it out of the repository.
 
 ## Configuration
 
@@ -74,6 +83,8 @@ Start from the example:
 mkdir -p "$HOME/Library/Application Support/TopstepXFloatPanel"
 cp outputs/topstepx_config.example.json "$HOME/Library/Application Support/TopstepXFloatPanel/topstepx_config.json"
 ```
+
+For a self-contained private copy between your own Macs, see `outputs/PORTABLE_README.txt`. Do not commit real config files or app bundles containing credentials.
 
 Edit the file and keep `readOnly` set to `true` until quotes, accounts, positions, and order previews are verified:
 
@@ -138,6 +149,14 @@ TSX Deck 是一个 macOS 原生 TopstepX / ProjectX Gateway API 悬浮交易面�
 - 根据 API 返回显示账户、持仓、均价、RP&L、U-PNL、连接状态。
 - 内置订单和 TP 音效。
 - 仓库只提供示例配置，真实凭据从本机 Application Support 读取。
+
+### 最新界面优化
+
+- 优化 Market / Limit 分段切换控件，让 Order Ticket 更简洁、专业。
+- 重排 Limit 下单区域，加入一体化限价输入、紧凑数量控件和更清晰的 TP / SL 卡片。
+- 优化 Working Orders，增加数据来源 pill、居中加载/空状态，并保留滚动位置。
+- 优化底部状态栏，把 API、Stream、Market 连接状态集中成更干净的健康状态条。
+- 保持原生悬浮窗宽度稳定，同时让高度随当前下单模式和挂单列表自适应。
 
 ### 构建
 

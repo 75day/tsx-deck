@@ -3,7 +3,12 @@ set -euo pipefail
 
 # TSX Deck build script
 # Produces universal binary + properly signed .app with hardened runtime.
-# Only ships the EXAMPLE config (real creds must live in App Support).
+#
+# For easy transfer between your own Macs:
+# - You can place a real topstepx_config.json in this outputs/ folder.
+# - The build will bundle it into the .app so the whole folder becomes
+#   self-contained for direct copy & use on another of your computers.
+# - If no real config is present here, only the safe example is bundled.
 
 APP_NAME="TSX Deck"
 EXECUTABLE_NAME="TopstepXFloatPanel"
@@ -52,13 +57,23 @@ cp "$OUT_APP/Contents/MacOS/$EXECUTABLE_NAME" "$BARE_OUT"
 chmod +x "$BARE_OUT"
 echo "→ Bare binary: $BARE_OUT"
 
-# 2. Copy safe resources only (example config, never real creds)
-echo "→ Copying resources (example config only)..."
+# 2. Copy resources
+echo "→ Copying resources..."
 cp "$RES_DIR/topstepx_icon.icns" "$OUT_APP/Contents/Resources/"
 cp "$RES_DIR/topstepx_icon.png" "$OUT_APP/Contents/Resources/" 2>/dev/null || true
 
-# Always ship the EXAMPLE as the bundled config
-cp "$RES_DIR/topstepx_config.example.json" "$OUT_APP/Contents/Resources/topstepx_config.json"
+# Config handling for easy transfer between your own Macs:
+# Place your real topstepx_config.json directly in this outputs/ folder (next to build_app.sh).
+# If present, it will be bundled into the .app so you can copy the whole folder
+# and run the app directly on another of your Macs with minimal hassle.
+# If no real config is here, the safe example is used instead.
+if [ -f "$SCRIPT_DIR/topstepx_config.json" ]; then
+    echo "   Using real topstepx_config.json from this folder (bundled for direct use on other Macs)"
+    cp "$SCRIPT_DIR/topstepx_config.json" "$OUT_APP/Contents/Resources/topstepx_config.json"
+else
+    echo "   No real topstepx_config.json found here. Bundling the example only."
+    cp "$RES_DIR/topstepx_config.example.json" "$OUT_APP/Contents/Resources/topstepx_config.json"
+fi
 
 # Optional: copy sounds if present (for bundled sound support)
 for caf in "$SCRIPT_DIR"/*.caf "$RES_DIR"/*.caf; do
@@ -93,8 +108,22 @@ codesign --force --options runtime --timestamp --deep \
 
 rm -f /tmp/entitlements.$$.plist
 
+# Touch the app bundle to help macOS notice changes (reduces icon cache problems)
+touch "$OUT_APP"
+
 echo "✅ Done: $OUT_APP"
-echo "   (universal, hardened, example config only, LSUIElement-enabled float panel behavior)"
+echo "   (universal, hardened runtime, LSUIElement-enabled float panel)"
 echo ""
 echo "To test: open $OUT_APP"
-echo "Real config should now live at: ~/Library/Application Support/TopstepXFloatPanel/topstepx_config.json"
+echo ""
+echo "Transfer note:"
+echo "  - If you put your real topstepx_config.json in this outputs/ folder before building,"
+echo "    it is now bundled inside the .app."
+echo "  - You can copy the entire outputs/ folder to another of your Macs and run the .app directly"
+echo "    (or re-run ./build_app.sh there for a fresh ad-hoc signature)."
+echo "  - See PORTABLE_README.txt in this folder for full instructions."
+echo ""
+echo "If the app icon appears white in Finder after build/copy:"
+echo "  touch \"$OUT_APP\""
+echo "  killall Dock"
+echo "Then reopen the folder in Finder (or log out and back in if needed)."

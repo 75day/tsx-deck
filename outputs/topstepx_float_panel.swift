@@ -794,6 +794,15 @@ extension NSView {
     }
 }
 
+final class TrackingScrollView: NSScrollView {
+    var onScroll: ((CGFloat) -> Void)?
+
+    override func reflectScrolledClipView(_ clipView: NSClipView) {
+        super.reflectScrolledClipView(clipView)
+        onScroll?(clipView.bounds.origin.y)
+    }
+}
+
 final class FillBar: NSView {
     var palette = darkPalette {
         didSet { needsDisplay = true }
@@ -1308,6 +1317,9 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     var footerStreamNameLabel: NSTextField?
     var footerMarketDotLabel: NSTextField?
     var footerMarketNameLabel: NSTextField?
+    var workingOrdersScrollY: CGFloat = 0
+    var workingOrdersRestoringScroll = false
+    var workingOrdersScrollView: TrackingScrollView?
     var sellQuoteButton: QuoteButton?
     var buyQuoteButton: QuoteButton?
     var spreadButton: SpreadBadge?
@@ -1533,6 +1545,14 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     func rebuild(disableAnimations: Bool = false, force: Bool = false) {
         if isRebuilding { return }
+
+        // Capture current scroll position from the *existing* scroll view before we tear it down
+        // in this rebuild. This ensures we have the user's latest position even if onScroll
+        // didn't fire for some internal adjustment.
+        if let scroll = workingOrdersScrollView, !workingOrdersRestoringScroll {
+            workingOrdersScrollY = scroll.contentView.bounds.origin.y
+        }
+
         if !force && isTicketInputActivelyEditing() {
             pendingTicketInputRebuild = true
             updateFooterStatus()
@@ -1575,6 +1595,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         updateFooterStatus()
         DispatchQueue.main.async { [weak self] in
             self?.fitWindowToContent()
+            // Nest another async so restore happens *after* the window resize + layout side-effects
+            // from setContentSize / frame change have settled. This prevents the system from
+            // re-adjusting the scroll position to bottom as a side effect of the height change.
+            DispatchQueue.main.async { [weak self] in
+                self?.restoreWorkingOrdersScrollPosition()
+            }
         }
     }
 
@@ -1584,14 +1610,32 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         root.layoutSubtreeIfNeeded()
         let targetHeight = ceil(root.fittingSize.height + 2)
         let clampedHeight = max(360, min(targetHeight, 720))
+        let targetWidth: CGFloat = 284
         let currentHeight = content.bounds.height
-        guard abs(currentHeight - clampedHeight) > 2 else { return }
+        let currentWidth = content.bounds.width
+        guard abs(currentHeight - clampedHeight) > 2 || abs(currentWidth - targetWidth) > 2 else { return }
 
         let frame = window.frame
         let topY = frame.maxY
-        window.setContentSize(NSSize(width: 284, height: clampedHeight))
+        window.setContentSize(NSSize(width: targetWidth, height: clampedHeight))
         let resized = window.frame
         window.setFrameOrigin(NSPoint(x: resized.minX, y: topY - resized.height))
+    }
+
+    private func restoreWorkingOrdersScrollPosition() {
+        guard let scroll = workingOrdersScrollView,
+              !workingOrdersRestoringScroll else { return }
+        workingOrdersRestoringScroll = true
+        scroll.layoutSubtreeIfNeeded()
+        if let document = scroll.documentView {
+            let maxY = max(0, document.frame.height - scroll.contentView.bounds.height)
+            let y = min(max(0, workingOrdersScrollY), maxY)
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.workingOrdersRestoringScroll = false
+        }
     }
 
     func header() -> NSView {
@@ -1763,7 +1807,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     func ticketCard() -> NSView {
         let panel = NSView()
-        panel.fixedHeight(orderType == "LIMIT" ? 369 : 206)
+        panel.fixedHeight(orderType == "LIMIT" ? 341 : 177)
 
         let sellQuote = sideQuoteButton(side: "SELL")
         let buyQuote = sideQuoteButton(side: "BUY")
@@ -1772,15 +1816,23 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         buyQuoteButton = buyQuote
         spreadButton = spread
 
-        let selectedTabBg = alpha(palette.blue, isDark ? 0.16 : 0.10)
-        let market = PillButton("Market", bg: orderType == "MARKET" ? selectedTabBg : clearSurface(), fg: orderType == "MARKET" ? palette.text : palette.muted, size: 9)
-        let limit = PillButton("Limit", bg: orderType == "LIMIT" ? selectedTabBg : clearSurface(), fg: orderType == "LIMIT" ? palette.text : palette.muted, size: 9)
+        let selectedTabBg = alpha(palette.blue, isDark ? 0.36 : 0.20)
+        let inactiveTabBg = NSColor.clear
+        let market = PillButton("Market", bg: orderType == "MARKET" ? selectedTabBg : inactiveTabBg, fg: orderType == "MARKET" ? palette.text : palette.muted, size: 9)
+        let limit = PillButton("Limit", bg: orderType == "LIMIT" ? selectedTabBg : inactiveTabBg, fg: orderType == "LIMIT" ? palette.text : palette.muted, size: 9)
         market.target = self
         market.action = #selector(selectMarketOrder)
         limit.target = self
         limit.action = #selector(selectLimitOrder)
-        market.fixedHeight(20)
-        limit.fixedHeight(20)
+        market.fixedHeight(22)
+        limit.fixedHeight(22)
+
+        let orderTypeTabs = NSView()
+        orderTypeTabs.wantsLayer = true
+        orderTypeTabs.layer?.cornerRadius = 8
+        orderTypeTabs.layer?.backgroundColor = alpha(palette.surface2, isDark ? 0.62 : 0.86).cgColor
+        orderTypeTabs.layer?.borderWidth = 1
+        orderTypeTabs.layer?.borderColor = alpha(palette.border, 0.55).cgColor
 
         let priceRow = orderType == "LIMIT" ? limitPriceRow() : zeroHeightView()
 
@@ -1790,8 +1842,8 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         minus.action = #selector(decrementQty)
         plus.target = self
         plus.action = #selector(incrementQty)
-        let qtyRow = quantityControlRow(minus: minus, plus: plus)
-        let qtyQuickRow = quickQtyRow()
+        let qtyRow = quantityAndQuickQtyRow(minus: minus, plus: plus)
+        let qtyQuickRow = zeroHeightView()
 
         let bracketRow = orderType == "LIMIT" ? protectionRow() : zeroHeightView()
 
@@ -1807,9 +1859,13 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         submit.isEnabled = !quoteSyncing
         submit.fixedHeight(38)
 
-        [sellQuote, buyQuote, spread, market, limit, priceRow, qtyRow, qtyQuickRow, bracketRow, risk, submit].forEach {
+        [sellQuote, buyQuote, spread, orderTypeTabs, priceRow, qtyRow, qtyQuickRow, bracketRow, risk, submit].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             panel.addSubview($0)
+        }
+        [market, limit].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            orderTypeTabs.addSubview($0)
         }
 
         NSLayoutConstraint.activate([
@@ -1822,16 +1878,22 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             spread.centerXAnchor.constraint(equalTo: panel.centerXAnchor),
             spread.centerYAnchor.constraint(equalTo: sellQuote.centerYAnchor),
 
-            market.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            market.topAnchor.constraint(equalTo: sellQuote.bottomAnchor, constant: 6),
-            market.trailingAnchor.constraint(equalTo: panel.centerXAnchor, constant: -1),
-            limit.leadingAnchor.constraint(equalTo: panel.centerXAnchor, constant: 1),
-            limit.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
+            orderTypeTabs.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
+            orderTypeTabs.topAnchor.constraint(equalTo: sellQuote.bottomAnchor, constant: 6),
+            orderTypeTabs.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
+            orderTypeTabs.heightAnchor.constraint(equalToConstant: 24),
+
+            market.leadingAnchor.constraint(equalTo: orderTypeTabs.leadingAnchor, constant: 2),
+            market.topAnchor.constraint(equalTo: orderTypeTabs.topAnchor, constant: 1),
+            market.bottomAnchor.constraint(equalTo: orderTypeTabs.bottomAnchor, constant: -1),
+            market.trailingAnchor.constraint(equalTo: orderTypeTabs.centerXAnchor, constant: -1),
+            limit.leadingAnchor.constraint(equalTo: orderTypeTabs.centerXAnchor, constant: 1),
+            limit.trailingAnchor.constraint(equalTo: orderTypeTabs.trailingAnchor, constant: -2),
             limit.centerYAnchor.constraint(equalTo: market.centerYAnchor),
 
             priceRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
             priceRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            priceRow.topAnchor.constraint(equalTo: market.bottomAnchor, constant: orderType == "LIMIT" ? 7 : 0),
+            priceRow.topAnchor.constraint(equalTo: orderTypeTabs.bottomAnchor, constant: orderType == "LIMIT" ? 7 : 0),
 
             qtyRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
             qtyRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
@@ -1839,7 +1901,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
             qtyQuickRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
             qtyQuickRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            qtyQuickRow.topAnchor.constraint(equalTo: qtyRow.bottomAnchor, constant: 5),
+            qtyQuickRow.topAnchor.constraint(equalTo: qtyRow.bottomAnchor),
 
             bracketRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
             bracketRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
@@ -1865,12 +1927,11 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         let hasOrders = orderCount > 0
         let hasPosition = positionCount > 0
 
-        let head = hstack(spacing: 8)
-        head.addArrangedSubview(text("WORKING ORDERS", 10, .semibold, palette.text))
+        let head = hstack(spacing: 7)
+        head.addArrangedSubview(text("WORKING ORDERS", 9, .medium, alpha(palette.text, 0.88)))
         head.addArrangedSubview(orderCountText(count: orderCount))
         head.addArrangedSubview(spacer())
-        head.addArrangedSubview(text(orderDataSourceText(), 8, .regular, palette.muted))
-        head.addArrangedSubview(orderDisclosureButton())
+        head.addArrangedSubview(orderDataSourcePill())
         box.addArrangedSubview(head)
 
         if lastSnapshot != nil {
@@ -1880,8 +1941,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
                 box.addArrangedSubview(openOrdersList(orders))
             }
         } else {
-            let loading = text("Loading orders from API...", 10, .regular, palette.muted)
-            box.addArrangedSubview(loading)
+            box.addArrangedSubview(openOrdersStatusState("Loading orders from API..."))
         }
 
         box.addArrangedSubview(orderActionRow(hasOrders: hasOrders, hasPosition: hasPosition))
@@ -1889,7 +1949,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     }
 
     func footer() -> NSView {
-        let box = vstack(spacing: 4)
+        let box = hstack(spacing: 10)
+        box.addArrangedSubview(footerConnectionStrip())
+        box.addArrangedSubview(spacer())
+
+        let meta = vstack(spacing: 3)
+        meta.alignment = .trailing
         let top = hstack(spacing: 6)
         let last = text(lastSyncText, 8, .semibold, palette.text)
         footerLastLabel = last
@@ -1900,24 +1965,19 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         eventLabel.maximumNumberOfLines = 1
         eventLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         top.addArrangedSubview(eventLabel)
-        box.addArrangedSubview(top)
+        meta.addArrangedSubview(top)
 
-        let bottom = hstack(spacing: 9)
-        bottom.addArrangedSubview(footerConnectionState("API", live: apiStatusText.contains("Connected")))
-        bottom.addArrangedSubview(footerConnectionState("Stream", live: streamStatusText.contains("Live")))
-        bottom.addArrangedSubview(footerConnectionState("Market", live: marketStatusText.contains("Live")))
-        bottom.addArrangedSubview(spacer())
         let snapshot = text(snapshotStatusText, 8, .regular, palette.muted)
         footerSnapshotLabel = snapshot
-        bottom.addArrangedSubview(snapshot)
-        box.addArrangedSubview(bottom)
+        meta.addArrangedSubview(snapshot)
+        box.addArrangedSubview(meta)
         let view = card(box, pad: 7)
         updateFooterStatus()
         return view
     }
 
     func orderCountText(count: Int) -> NSTextField {
-        let label = text("\(count)", 10, .semibold, count > 0 ? palette.orange : palette.muted)
+        let label = text("\(count)", 9, .medium, count > 0 ? palette.orange : alpha(palette.muted, 0.86))
         label.alignment = .left
         return label
     }
@@ -1929,6 +1989,25 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         button.layer?.cornerRadius = 9
         button.isEnabled = false
         return button
+    }
+
+    func orderDataSourcePill() -> NSView {
+        let live = hasRealtimeOrderState
+        let dot = text("●", 7, .semibold, live ? palette.green : palette.muted)
+        let label = text(live ? "STREAM" : "REST", 7.5, .semibold, live ? palette.text : palette.muted)
+        let detail = text(live ? "live" : "snapshot", 7.5, .medium, alpha(palette.muted, 0.82))
+        let row = hstack(spacing: 4)
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 7, bottom: 0, right: 7)
+        row.addArrangedSubview(dot)
+        row.addArrangedSubview(label)
+        row.addArrangedSubview(detail)
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 8
+        row.layer?.backgroundColor = alpha(live ? palette.green : palette.text, live ? 0.10 : 0.055).cgColor
+        row.layer?.borderWidth = 1
+        row.layer?.borderColor = alpha(live ? palette.green : palette.border, live ? 0.22 : 0.38).cgColor
+        row.fixedHeight(17)
+        return row
     }
 
     func orderStatePill(count: Int) -> NSButton {
@@ -1943,95 +2022,206 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     }
 
     func openOrdersEmptyState() -> NSView {
+        return openOrdersStatusState("No working orders")
+    }
+
+    func openOrdersStatusState(_ message: String) -> NSView {
         let box = NSView()
-        box.fixedHeight(24)
-        let label = text("No working orders", 10, .regular, palette.muted)
+        box.fixedHeight(34)
+        let label = text(message, 10, .medium, alpha(palette.muted, 0.92))
+        label.alignment = .center
         label.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(label)
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+            label.centerXAnchor.constraint(equalTo: box.centerXAnchor),
             label.centerYAnchor.constraint(equalTo: box.centerYAnchor)
         ])
         return box
     }
 
     func orderActionRow(hasOrders: Bool, hasPosition: Bool) -> NSView {
-        let row = hstack(spacing: 8)
-        row.addArrangedSubview(spacer())
         let cancel = riskActionButton("Cancel All Orders", color: palette.orange, active: hasOrders && liveTradingEnabled())
         let flatten = riskActionButton("Flatten Position", color: palette.red, active: hasPosition && liveTradingEnabled())
-        cancel.fixedWidth(112)
-        flatten.fixedWidth(108)
+        cancel.fixedWidth(105)
+        flatten.fixedWidth(105)
         cancel.target = self
         cancel.action = #selector(cancelAllOrdersClicked)
         flatten.target = self
         flatten.action = #selector(flattenPositionClicked)
-        row.addArrangedSubview(cancel)
-        row.addArrangedSubview(flatten)
-        return row
+
+        let buttons = hstack(spacing: 8)
+        buttons.addArrangedSubview(cancel)
+        buttons.addArrangedSubview(flatten)
+
+        // Center the buttons with good side margins for symmetric, professional look.
+        // The container will be stretched by parent card, but buttons stay centered with breathing room from edges.
+        let container = NSView()
+        container.addSubview(buttons)
+        buttons.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            buttons.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            buttons.topAnchor.constraint(equalTo: container.topAnchor),
+            buttons.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            buttons.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 20),
+            buttons.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -20),
+        ])
+        return container
     }
 
     func openOrdersList(_ orders: [[String: Any]]) -> NSView {
-        let list = vstack(spacing: 5)
+        let list = vstack(spacing: 0)
+        list.addArrangedSubview(workingOrdersTableHeader())
         for order in orders {
             list.addArrangedSubview(workingOrderRow(order))
         }
         if orders.count <= 3 {
-            return list
+            workingOrdersScrollY = 0
+            workingOrdersScrollView = nil
+            return workingOrdersListContainer(list, height: CGFloat(20 + orders.count * 27))
         }
 
-        let scroll = NSScrollView()
+        // Let the list compute its exact height from actual row sizes (more accurate than *41)
+        list.layoutSubtreeIfNeeded()
+
+        let scroll = TrackingScrollView()
+        workingOrdersRestoringScroll = true   // prevent initial layout reflects from overwriting the saved user y with 0 or other
         scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
-        scroll.documentView = list
+        scroll.autohidesScrollers = false
+        scroll.onScroll = { [weak self] y in
+            guard let self, !self.workingOrdersRestoringScroll else { return }
+            self.workingOrdersScrollY = y
+        }
+
+        let document = NSView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        list.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(list)
+        scroll.documentView = document
+        NSLayoutConstraint.activate([
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            document.heightAnchor.constraint(equalToConstant: list.fittingSize.height),
+            list.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            list.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -10),
+            list.topAnchor.constraint(equalTo: document.topAnchor),
+            list.bottomAnchor.constraint(equalTo: document.bottomAnchor)
+        ])
         scroll.fixedHeight(104)
+        workingOrdersScrollView = scroll
         return scroll
     }
 
     func workingOrderRow(_ order: [String: Any]) -> NSView {
-        let box = vstack(spacing: 2)
-        box.wantsLayer = true
-        box.layer?.cornerRadius = 6
-        box.layer?.backgroundColor = alpha(palette.text, isDark ? 0.035 : 0.06).cgColor
-
         let side = orderSideText(order)
         let sideColor = side == "BUY" ? palette.green : palette.red
-        let top = hstack(spacing: 5)
-        top.addArrangedSubview(text(side, 9, .semibold, sideColor))
-        top.addArrangedSubview(text(orderTypeText(order), 9, .semibold, palette.text))
-        top.addArrangedSubview(digit("\(intValue(order["size"]) ?? 0)", 9, .medium, palette.text))
-        top.addArrangedSubview(spacer())
-        top.addArrangedSubview(text(orderStatusText(order), 8, .regular, palette.muted))
+        let status = orderStatusText(order)
+        let statusColor = ["Open", "Working", "Pending"].contains(status) ? palette.green : palette.muted
         let edit = orderRowButton("✎", color: palette.blue, action: #selector(editWorkingOrder(_:)), order: order)
         let cancel = orderRowButton("×", color: palette.orange, action: #selector(cancelWorkingOrder(_:)), order: order)
-        top.addArrangedSubview(edit)
-        top.addArrangedSubview(cancel)
-        box.addArrangedSubview(top)
 
-        let bottom = hstack(spacing: 5)
-        bottom.addArrangedSubview(text(orderPriceText(order), 9, .regular, palette.muted))
-        bottom.addArrangedSubview(spacer())
-        bottom.addArrangedSubview(text("#\(intValue(order["id"]) ?? 0)", 8, .regular, palette.muted))
-        bottom.addArrangedSubview(text(orderDataSourceText(), 8, .regular, palette.muted))
-        box.addArrangedSubview(bottom)
+        let row = workingOrdersTableRowBase()
+        row.wantsLayer = true
+        row.layer?.backgroundColor = alpha(palette.text, isDark ? 0.025 : 0.045).cgColor
+        row.addArrangedSubview(orderColumn(shortOrderIdText(order), width: 48, color: palette.text, weight: .medium))
+        row.addArrangedSubview(orderColumn(side, width: 30, color: sideColor, weight: .semibold))
+        row.addArrangedSubview(orderColumn(orderCompactTypeText(order), width: 32, color: palette.text, weight: .semibold))
+        row.addArrangedSubview(orderColumn("\(intValue(order["size"]) ?? 0)", width: 22, color: palette.text, weight: .medium, align: .center, digitFont: true))
+        row.addArrangedSubview(orderColumn(orderDisplayPriceText(order), width: 62, color: palette.text, weight: .medium, align: .center, digitFont: true))
+        row.addArrangedSubview(orderColumn(status.uppercased(), width: 36, color: statusColor, weight: .semibold, size: 7, align: .center))
+        row.addArrangedSubview(spacer())
+        row.addArrangedSubview(orderActionCluster(edit, cancel))
 
         let outer = NSView()
-        box.translatesAutoresizingMaskIntoConstraints = false
-        outer.addSubview(box)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        outer.addSubview(row)
         NSLayoutConstraint.activate([
-            box.leadingAnchor.constraint(equalTo: outer.leadingAnchor),
-            box.trailingAnchor.constraint(equalTo: outer.trailingAnchor),
-            box.topAnchor.constraint(equalTo: outer.topAnchor),
-            box.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
-            outer.heightAnchor.constraint(equalToConstant: 36)
+            row.leadingAnchor.constraint(equalTo: outer.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: outer.trailingAnchor),
+            row.topAnchor.constraint(equalTo: outer.topAnchor),
+            row.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
+            outer.heightAnchor.constraint(equalToConstant: 27)
         ])
         return outer
     }
 
+    func workingOrdersTableHeader() -> NSView {
+        let row = workingOrdersTableRowBase()
+        row.addArrangedSubview(orderHeaderColumn("ID", width: 48))
+        row.addArrangedSubview(orderHeaderColumn("SIDE", width: 30))
+        row.addArrangedSubview(orderHeaderColumn("TYPE", width: 32))
+        row.addArrangedSubview(orderHeaderColumn("QTY", width: 22, align: .center))
+        row.addArrangedSubview(orderHeaderColumn("PRICE", width: 62, align: .center))
+        row.addArrangedSubview(orderHeaderColumn("STATUS", width: 36, align: .center))
+        row.addArrangedSubview(spacer())
+        let actions = hstack(spacing: 8)
+        actions.fixedWidth(44)
+        actions.addArrangedSubview(orderHeaderColumn("E", width: 16, align: .center))
+        actions.addArrangedSubview(orderHeaderColumn("X", width: 16, align: .center))
+        row.addArrangedSubview(actions)
+
+        let outer = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        outer.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: outer.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: outer.trailingAnchor),
+            row.topAnchor.constraint(equalTo: outer.topAnchor),
+            row.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
+            outer.heightAnchor.constraint(equalToConstant: 20)
+        ])
+        return outer
+    }
+
+    func workingOrdersTableRowBase() -> NSStackView {
+        let row = hstack(spacing: 4)
+        row.alignment = .centerY
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        return row
+    }
+
+    func orderActionCluster(_ edit: NSButton, _ cancel: NSButton) -> NSStackView {
+        let actions = hstack(spacing: 8)
+        actions.fixedWidth(44)
+        actions.addArrangedSubview(edit)
+        actions.addArrangedSubview(cancel)
+        return actions
+    }
+
+    func workingOrdersListContainer(_ list: NSView, height: CGFloat) -> NSView {
+        let container = NSView()
+        list.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(list)
+        NSLayoutConstraint.activate([
+            list.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            list.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            list.topAnchor.constraint(equalTo: container.topAnchor),
+            list.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            container.heightAnchor.constraint(equalToConstant: height)
+        ])
+        container.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        container.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return container
+    }
+
+    func orderHeaderColumn(_ value: String, width: CGFloat, align: NSTextAlignment = .left) -> NSTextField {
+        return orderColumn(value, width: width, color: palette.muted, weight: .semibold, size: 7, align: align)
+    }
+
+    func orderColumn(_ value: String, width: CGFloat, color: NSColor, weight: NSFont.Weight, size: CGFloat = 8, align: NSTextAlignment = .left, digitFont: Bool = false) -> NSTextField {
+        let label = text(value, size, weight, color)
+        label.alignment = align
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.font = digitFont ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight) : NSFont.systemFont(ofSize: size, weight: weight)
+        label.fixedWidth(width)
+        return label
+    }
+
     func orderRowButton(_ title: String, color: NSColor, action: Selector, order: [String: Any]) -> NSButton {
-        let button = PillButton(title, bg: alpha(color, isDark ? 0.13 : 0.10), fg: color, size: 9)
-        button.fixedWidth(20)
+        let button = PillButton(title, bg: alpha(color, isDark ? 0.13 : 0.10), fg: color, size: 8)
+        button.fixedWidth(16)
         button.fixedHeight(16)
         button.layer?.cornerRadius = 8
         button.target = self
@@ -2093,6 +2283,21 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return row
     }
 
+    func footerConnectionStrip() -> NSView {
+        let row = hstack(spacing: 8)
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 7, bottom: 0, right: 7)
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 9
+        row.layer?.backgroundColor = alpha(palette.text, isDark ? 0.035 : 0.055).cgColor
+        row.layer?.borderWidth = 1
+        row.layer?.borderColor = alpha(palette.border, 0.28).cgColor
+        row.addArrangedSubview(footerConnectionState("API", live: apiStatusText.contains("Connected")))
+        row.addArrangedSubview(footerConnectionState("Stream", live: streamStatusText.contains("Live")))
+        row.addArrangedSubview(footerConnectionState("Market", live: marketStatusText.contains("Live")))
+        row.fixedHeight(21)
+        return row
+    }
+
     func updateFooterStatus() {
         footerLastLabel?.stringValue = lastSyncText
         footerLastLabel?.textColor = palette.text
@@ -2127,9 +2332,28 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return hasRealtimeOrderState ? "Stream" : "REST snapshot"
     }
 
+    func shortOrderIdText(_ order: [String: Any]) -> String {
+        guard let id = intValue(order["id"]) else { return "--" }
+        let raw = "\(id)"
+        return "#\(raw.count > 7 ? String(raw.suffix(7)) : raw)"
+    }
+
     func orderSideText(_ order: [String: Any]) -> String {
         guard let side = intValue(order["side"]) else { return "--" }
         return side == 0 ? "BUY" : "SELL"
+    }
+
+    func orderCompactTypeText(_ order: [String: Any]) -> String {
+        switch intValue(order["type"]) {
+        case 1: return "LMT"
+        case 2: return "MKT"
+        case 3: return "STP-L"
+        case 4: return "STP"
+        case 5: return "TRL"
+        case 6: return "BID"
+        case 7: return "ASK"
+        default: return "ORD"
+        }
     }
 
     func orderTypeText(_ order: [String: Any]) -> String {
@@ -2190,6 +2414,13 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             return "Trail \(number2(trail))"
         }
         return "@ MKT"
+    }
+
+    func orderDisplayPriceText(_ order: [String: Any]) -> String {
+        if let p = numberValue(order["limitPrice"]) ?? numberValue(order["stopPrice"]) ?? numberValue(order["trailPrice"]) {
+            return number2(p)
+        }
+        return "MKT"
     }
 
     func showRealtimeOrderToast(_ order: [String: Any], previous: [String: Any]?) {
@@ -2995,6 +3226,16 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return realtimeContractId ?? lastSnapshot?.contractId ?? contracts[selectedSymbol]?.id
     }
 
+    func officialSubmissionContractId() throws -> String {
+        guard let contractId = lastSnapshot?.contractId else {
+            throw ProjectXError.api("official contractId not confirmed")
+        }
+        guard realtimeContractId == contractId else {
+            throw ProjectXError.api("market stream not synced to official contract")
+        }
+        return contractId
+    }
+
     // Resolve tick/tickValue for a given contractId (from position or snapshot).
     // Falls back to selectedSymbol's spec. This ensures correct PnL calc even if
     // position contract differs from viewed symbol during transitions.
@@ -3554,7 +3795,20 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
         group.notify(queue: .main) {
             if let firstError {
-                completion(.failure(firstError))
+                let placedIds = ids.filter { $0 > 0 }
+                guard !placedIds.isEmpty,
+                      let accountId = payloads.compactMap({ self.intValue($0["accountId"]) }).first else {
+                    completion(.failure(firstError))
+                    return
+                }
+                self.cancelOrderIds(apiClient: apiClient, accountId: accountId, orderIds: placedIds) { cancelResult in
+                    switch cancelResult {
+                    case .success:
+                        completion(.failure(ProjectXError.api("partial protection send failed; rolled back \(placedIds.count) order(s): \(firstError.localizedDescription)")))
+                    case .failure(let cancelError):
+                        completion(.failure(ProjectXError.api("partial protection send failed; rollback failed for \(placedIds.map(String.init).joined(separator: ",")): \(cancelError.localizedDescription); original: \(firstError.localizedDescription)")))
+                    }
+                }
             } else {
                 completion(.success(ids))
             }
@@ -3743,7 +3997,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         guard apiClient != nil else { throw ProjectXError.api("API config missing") }
         guard canTradeText == "CAN TRADE" else { throw ProjectXError.api("account is not tradable: \(canTradeText)") }
         guard let accountId = selectedAccountId else { throw ProjectXError.api("accountId missing") }
-        guard let contractId = activeContractId() else { throw ProjectXError.api("contractId missing") }
+        let contractId = try officialSubmissionContractId()
         guard isQuoteFresh() else { throw ProjectXError.api("market quote stale or missing") }
         guard isOppositeOpenPositionOrder(side: side) else { throw ProjectXError.api("protection must be opposite side of open position") }
         let size = min(orderQty, positionSizeText())
@@ -3818,7 +4072,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         guard apiClient != nil else { throw ProjectXError.api("API config missing") }
         guard canTradeText == "CAN TRADE" else { throw ProjectXError.api("account is not tradable: \(canTradeText)") }
         guard let accountId = selectedAccountId else { throw ProjectXError.api("accountId missing") }
-        guard let contractId = realtimeContractId ?? lastSnapshot?.contractId else { throw ProjectXError.api("contractId missing") }
+        let contractId = try officialSubmissionContractId()
         guard isQuoteFresh() else { throw ProjectXError.api("market quote stale or missing") }
         guard orderQty > 0 else { throw ProjectXError.api("size must be positive") }
         if slEnabled {
@@ -3844,7 +4098,11 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             limitPrice = entry
         }
 
-        let includeBrackets = apiClient?.config.sendBrackets == true && orderType == "LIMIT" && !isOppositeOpenPositionOrder(side: side)
+        let isEntryLimit = orderType == "LIMIT" && !isOppositeOpenPositionOrder(side: side)
+        if isEntryLimit && (tpEnabled || slEnabled) && apiClient?.config.sendBrackets != true {
+            throw ProjectXError.api("official bracket sending is disabled; turn off TP/SL or enable sendBrackets")
+        }
+        let includeBrackets = apiClient?.config.sendBrackets == true && isEntryLimit
         let bracketSign = side == "BUY" ? 1 : -1
         let stopLossBracket: Any = includeBrackets && slEnabled ? ["ticks": -bracketSign * effectiveSLTicks(), "type": 4] : NSNull()
         let takeProfitBracket: Any = includeBrackets && tpEnabled ? ["ticks": bracketSign * effectiveTPTicks(), "type": 1] : NSNull()
@@ -4231,6 +4489,105 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return box
     }
 
+    func quantityAndQuickQtyRow(minus: NSButton, plus: NSButton) -> NSView {
+        let box = NSView()
+        box.fixedHeight(30)
+
+        let surface = NSView()
+        surface.wantsLayer = true
+        surface.layer?.cornerRadius = 6
+        surface.layer?.backgroundColor = inputBackgroundColor().cgColor
+
+        let qty = quantityInputField()
+        let symbol = text(selectedSymbol, 8, .medium, palette.muted)
+
+        [minus, plus].forEach {
+            $0.fixedHeight(24)
+            $0.fixedWidth(24)
+        }
+
+        let row = NSView()
+        let quickRow = hstack(spacing: 4)
+        for value in [1, 3, 5, 10, 15] {
+            let selected = orderQty == value
+            let button = PillButton("\(value)", bg: selected ? alpha(palette.text, isDark ? 0.30 : 0.20) : alpha(palette.text, isDark ? 0.08 : 0.07), fg: selected ? palette.text : palette.muted, size: 9)
+            button.fixedWidth(24)
+            button.fixedHeight(24)
+            button.layer?.cornerRadius = 12
+            button.target = self
+            button.action = #selector(selectQuickQty(_:))
+            quickRow.addArrangedSubview(button)
+        }
+
+        row.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(row)
+        [surface, qty, symbol, minus, plus, quickRow].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview($0)
+        }
+
+        let controlWidth = min(max(CGFloat(66 + selectedSymbol.count * 5 + String(orderQty).count * 3), 70), 78)
+        NSLayoutConstraint.activate([
+            row.centerXAnchor.constraint(equalTo: box.centerXAnchor),
+            row.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            row.widthAnchor.constraint(equalToConstant: 282),
+            row.heightAnchor.constraint(equalToConstant: 24),
+
+            surface.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            surface.widthAnchor.constraint(equalToConstant: controlWidth),
+            surface.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            surface.heightAnchor.constraint(equalToConstant: 24),
+
+            minus.leadingAnchor.constraint(equalTo: surface.trailingAnchor, constant: 4),
+            minus.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
+
+            plus.leadingAnchor.constraint(equalTo: minus.trailingAnchor, constant: 4),
+            plus.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
+
+            quickRow.leadingAnchor.constraint(equalTo: plus.trailingAnchor, constant: 8),
+            quickRow.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            quickRow.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
+
+            qty.leadingAnchor.constraint(equalTo: surface.leadingAnchor, constant: 8),
+            qty.trailingAnchor.constraint(equalTo: symbol.leadingAnchor, constant: -5),
+            qty.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
+            symbol.trailingAnchor.constraint(equalTo: surface.trailingAnchor, constant: -7),
+            symbol.centerYAnchor.constraint(equalTo: surface.centerYAnchor)
+        ])
+
+        return box
+    }
+
+    func quantityInputField() -> PriceInputTextField {
+        let qty = PriceInputTextField(string: "\(orderQty)")
+        qty.identifier = NSUserInterfaceItemIdentifier("orderQty")
+        qty.delegate = self
+        qty.target = self
+        qty.action = #selector(ticketInputCommitted(_:))
+        qty.onBegin = { [weak self] field in
+            self?.beginTicketInput(field)
+        }
+        qty.onCommit = { [weak self] field in
+            guard let self, let id = field.identifier?.rawValue else { return }
+            self.activeTicketInput = nil
+            self.activeTicketField = nil
+            self.commitTicketInput(field, id: id)
+        }
+        qty.cell = CenteredTextFieldCell(textCell: "\(orderQty)")
+        qty.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        qty.textColor = palette.text
+        qty.alignment = .center
+        qty.isEditable = true
+        qty.isSelectable = true
+        qty.isBezeled = false
+        qty.drawsBackground = false
+        qty.wantsLayer = true
+        qty.layer?.cornerRadius = 6
+        qty.cell?.wraps = false
+        qty.cell?.usesSingleLineMode = true
+        return qty
+    }
+
     func quickQtyRow() -> NSView {
         let box = NSView()
         box.fixedHeight(24)
@@ -4257,7 +4614,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     func protectionRow() -> NSView {
         let box = NSView()
-        box.fixedHeight(88)
+        box.fixedHeight(106)
 
         let priceMode = PillButton("Price", bg: bracketMode == "PRICE" ? alpha(palette.blue, isDark ? 0.42 : 0.18) : palette.surface2, fg: bracketMode == "PRICE" ? palette.text : palette.muted, size: 8)
         let ticks = PillButton("Ticks", bg: bracketMode == "TICKS" ? alpha(palette.blue, isDark ? 0.42 : 0.18) : palette.surface2, fg: bracketMode == "TICKS" ? palette.text : palette.muted, size: 8)
@@ -4265,10 +4622,15 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         ticks.action = #selector(selectTicksMode)
         priceMode.target = self
         priceMode.action = #selector(selectPriceMode)
-        ticks.fixedWidth(48)
-        priceMode.fixedWidth(48)
+        ticks.fixedWidth(52)
+        priceMode.fixedWidth(52)
         ticks.fixedHeight(20)
         priceMode.fixedHeight(20)
+
+        let modeControl = NSView()
+        modeControl.wantsLayer = true
+        modeControl.layer?.cornerRadius = 7
+        modeControl.layer?.backgroundColor = alpha(palette.surface2, isDark ? 0.72 : 0.90).cgColor
 
         let priceProtectionReady = !(quoteSyncing && bracketMode == "PRICE")
         let tp = compactField(bracketMode == "PRICE" ? "TP price" : "TP ticks", bracketValueText(kind: "TP"), id: "bracketTP", enabled: tpEnabled && priceProtectionReady)
@@ -4276,27 +4638,49 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         let tpCheck = protectionToggle(title: "TP", enabled: tpEnabled, action: #selector(toggleTPProtection))
         let slCheck = protectionToggle(title: "SL", enabled: slEnabled, action: #selector(toggleSLProtection))
         let fieldWidth = bracketInputWidth()
+        let tpPanel = protectionPanel(color: palette.green, active: tpEnabled)
+        let slPanel = protectionPanel(color: palette.red, active: slEnabled)
 
-        [priceMode, ticks, tpCheck, slCheck, tp, sl].forEach {
+        [modeControl, tpPanel, slPanel, tpCheck, slCheck, tp, sl].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             box.addSubview($0)
         }
+        [priceMode, ticks].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            modeControl.addSubview($0)
+        }
 
         NSLayoutConstraint.activate([
-            priceMode.centerXAnchor.constraint(equalTo: tp.centerXAnchor),
-            priceMode.topAnchor.constraint(equalTo: box.topAnchor, constant: 2),
-            ticks.centerXAnchor.constraint(equalTo: sl.centerXAnchor),
-            ticks.centerYAnchor.constraint(equalTo: priceMode.centerYAnchor),
+            modeControl.centerXAnchor.constraint(equalTo: box.centerXAnchor),
+            modeControl.topAnchor.constraint(equalTo: box.topAnchor),
+            modeControl.widthAnchor.constraint(equalToConstant: 110),
+            modeControl.heightAnchor.constraint(equalToConstant: 22),
 
-            tpCheck.topAnchor.constraint(equalTo: priceMode.bottomAnchor, constant: 12),
-            tpCheck.centerXAnchor.constraint(equalTo: tp.centerXAnchor),
-            slCheck.centerXAnchor.constraint(equalTo: sl.centerXAnchor),
+            priceMode.leadingAnchor.constraint(equalTo: modeControl.leadingAnchor, constant: 2),
+            priceMode.centerYAnchor.constraint(equalTo: modeControl.centerYAnchor),
+            ticks.leadingAnchor.constraint(equalTo: priceMode.trailingAnchor, constant: 2),
+            ticks.trailingAnchor.constraint(equalTo: modeControl.trailingAnchor, constant: -2),
+            ticks.centerYAnchor.constraint(equalTo: modeControl.centerYAnchor),
+
+            tpPanel.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 4),
+            tpPanel.trailingAnchor.constraint(equalTo: box.centerXAnchor, constant: -5),
+            tpPanel.topAnchor.constraint(equalTo: modeControl.bottomAnchor, constant: 9),
+            tpPanel.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -1),
+
+            slPanel.leadingAnchor.constraint(equalTo: box.centerXAnchor, constant: 5),
+            slPanel.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -4),
+            slPanel.topAnchor.constraint(equalTo: tpPanel.topAnchor),
+            slPanel.bottomAnchor.constraint(equalTo: tpPanel.bottomAnchor),
+
+            tpCheck.topAnchor.constraint(equalTo: tpPanel.topAnchor, constant: 10),
+            tpCheck.centerXAnchor.constraint(equalTo: tpPanel.centerXAnchor),
+            slCheck.centerXAnchor.constraint(equalTo: slPanel.centerXAnchor),
             slCheck.centerYAnchor.constraint(equalTo: tpCheck.centerYAnchor),
 
             tp.topAnchor.constraint(equalTo: tpCheck.bottomAnchor, constant: 6),
-            tp.trailingAnchor.constraint(equalTo: box.centerXAnchor, constant: -12),
+            tp.centerXAnchor.constraint(equalTo: tpPanel.centerXAnchor),
             tp.widthAnchor.constraint(equalToConstant: fieldWidth),
-            sl.leadingAnchor.constraint(equalTo: box.centerXAnchor, constant: 12),
+            sl.centerXAnchor.constraint(equalTo: slPanel.centerXAnchor),
             sl.topAnchor.constraint(equalTo: tp.topAnchor),
             sl.widthAnchor.constraint(equalToConstant: fieldWidth)
         ])
@@ -4304,16 +4688,26 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return box
     }
 
+    func protectionPanel(color: NSColor, active: Bool) -> NSView {
+        let panel = NSView()
+        panel.wantsLayer = true
+        panel.layer?.cornerRadius = 7
+        panel.layer?.backgroundColor = alpha(color, active ? (isDark ? 0.10 : 0.06) : (isDark ? 0.025 : 0.04)).cgColor
+        panel.layer?.borderWidth = 1
+        panel.layer?.borderColor = alpha(color, active ? 0.62 : 0.16).cgColor
+        return panel
+    }
+
     func bracketInputWidth() -> CGFloat {
         let longest = max(bracketValueText(kind: "TP").count, bracketValueText(kind: "SL").count)
         let raw = CGFloat(longest * 8 + 22)
-        return min(max(raw, bracketMode == "PRICE" ? 86 : 42), bracketMode == "PRICE" ? 96 : 52)
+        return min(max(raw, bracketMode == "PRICE" ? 98 : 46), bracketMode == "PRICE" ? 108 : 56)
     }
 
     func protectionToggle(title: String, enabled: Bool, action: Selector) -> NSButton {
         let button = NSButton(checkboxWithTitle: title, target: self, action: action)
         button.state = enabled ? .on : .off
-        button.font = NSFont.systemFont(ofSize: 8, weight: .medium)
+        button.font = NSFont.systemFont(ofSize: 9, weight: .medium)
         button.contentTintColor = enabled ? palette.text : palette.muted
         button.setContentHuggingPriority(.required, for: .horizontal)
         return button
@@ -4802,20 +5196,27 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     func limitPriceRow() -> NSView {
         let box = NSView()
-        box.fixedHeight(50)
+        box.fixedHeight(34)
         let priceText = quoteSyncing ? "--" : number2(orderEntryPrice())
-        let priceFont = NSFont.monospacedDigitSystemFont(ofSize: adaptiveSize(for: priceText, base: 16, min: 13), weight: .semibold)
+        let priceFont = NSFont.monospacedDigitSystemFont(ofSize: adaptiveSize(for: priceText, base: 14, min: 12), weight: .semibold)
         let inputWidth = limitPriceInputWidth(priceText, font: priceFont)
 
-        let title = text(editingOrderId == nil ? "Limit Price" : "Order Price", 9, .medium, palette.muted)
+        let title = text(editingOrderId == nil ? "LIMIT PRICE" : "ORDER PRICE", 10, .semibold, palette.muted)
         title.alignment = .center
+        let row = NSView()
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 7
+        row.layer?.backgroundColor = inputBackgroundColor().cgColor
+        row.layer?.borderWidth = 1
+        row.layer?.borderColor = palette.border.cgColor
+
+        let labelCell = NSView()
+        labelCell.wantsLayer = true
+        labelCell.layer?.backgroundColor = alpha(palette.surface2, isDark ? 0.72 : 0.90).cgColor
 
         let control = NSView()
         control.wantsLayer = true
-        control.layer?.cornerRadius = 6
-        control.layer?.backgroundColor = inputBackgroundColor().cgColor
-        control.layer?.borderWidth = 1
-        control.layer?.borderColor = palette.border.cgColor
+        control.layer?.backgroundColor = NSColor.clear.cgColor
 
         let input = PriceInputTextField(string: priceText)
         input.identifier = NSUserInterfaceItemIdentifier("limitPrice")
@@ -4872,9 +5273,13 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         dividerLine.wantsLayer = true
         dividerLine.layer?.backgroundColor = palette.border.cgColor
 
+        row.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(row)
+        labelCell.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(labelCell)
         [title, control].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
-            box.addSubview($0)
+            row.addSubview($0)
         }
         [input, dividerLine, stepper].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
@@ -4882,31 +5287,42 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
 
         NSLayoutConstraint.activate([
-            title.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-            title.topAnchor.constraint(equalTo: box.topAnchor),
+            row.centerXAnchor.constraint(equalTo: box.centerXAnchor),
+            row.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            row.widthAnchor.constraint(equalToConstant: 238),
+            row.heightAnchor.constraint(equalToConstant: 32),
 
-            control.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-            control.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 4),
-            control.widthAnchor.constraint(equalToConstant: inputWidth + 48),
-            control.heightAnchor.constraint(equalToConstant: 34),
-            control.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+            labelCell.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            labelCell.topAnchor.constraint(equalTo: row.topAnchor),
+            labelCell.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            labelCell.widthAnchor.constraint(equalToConstant: 82),
 
-            input.leadingAnchor.constraint(equalTo: control.leadingAnchor, constant: 8),
+            title.leadingAnchor.constraint(equalTo: labelCell.leadingAnchor, constant: 5),
+            title.trailingAnchor.constraint(equalTo: labelCell.trailingAnchor, constant: -5),
+            title.centerYAnchor.constraint(equalTo: control.centerYAnchor),
+
+            control.leadingAnchor.constraint(equalTo: labelCell.trailingAnchor),
+            control.topAnchor.constraint(equalTo: row.topAnchor),
+            control.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            control.heightAnchor.constraint(equalToConstant: 32),
+            control.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+
+            input.leadingAnchor.constraint(equalTo: control.leadingAnchor, constant: 7),
             input.topAnchor.constraint(equalTo: control.topAnchor),
             input.bottomAnchor.constraint(equalTo: control.bottomAnchor),
             input.widthAnchor.constraint(equalToConstant: inputWidth),
 
-            dividerLine.leadingAnchor.constraint(equalTo: input.trailingAnchor, constant: 5),
+            dividerLine.leadingAnchor.constraint(equalTo: input.trailingAnchor, constant: 4),
             dividerLine.widthAnchor.constraint(equalToConstant: 1),
             dividerLine.topAnchor.constraint(equalTo: control.topAnchor, constant: 5),
             dividerLine.bottomAnchor.constraint(equalTo: control.bottomAnchor, constant: -5),
 
-            stepper.leadingAnchor.constraint(equalTo: dividerLine.trailingAnchor, constant: 5),
-            stepper.trailingAnchor.constraint(equalTo: control.trailingAnchor, constant: -5),
+            stepper.leadingAnchor.constraint(equalTo: dividerLine.trailingAnchor, constant: 4),
+            stepper.trailingAnchor.constraint(equalTo: control.trailingAnchor, constant: -4),
             stepper.centerYAnchor.constraint(equalTo: control.centerYAnchor),
 
-            up.heightAnchor.constraint(equalToConstant: 14),
-            down.heightAnchor.constraint(equalToConstant: 14)
+            up.heightAnchor.constraint(equalToConstant: 13),
+            down.heightAnchor.constraint(equalToConstant: 13)
         ])
 
         return box
@@ -4914,7 +5330,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     func limitPriceInputWidth(_ value: String, font: NSFont) -> CGFloat {
         let textWidth = (value as NSString).size(withAttributes: [.font: font]).width
-        return min(max(ceil(textWidth + 22), 106), 136)
+        return min(max(ceil(textWidth + 18), 92), 110)
     }
 
     func accountPopupWidth(_ value: String, font: NSFont) -> CGFloat {
@@ -4944,33 +5360,89 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     func ticketRiskSummary() -> NSView {
         let box = NSView()
 
-        let left = hstack(spacing: 5)
-        let riskValid = slEnabled && effectiveSLTicks() > 0
-        left.addArrangedSubview(text("Risk", 10, .regular, palette.muted))
-        left.addArrangedSubview(adaptiveDigit(riskSummaryText(), base: 10, min: 8, weight: .semibold, color: riskValid ? palette.text : palette.orange, width: 86, alignment: .left))
+        let sl = riskSummarySegment(
+            label: "SL",
+            value: slEnabled ? summaryAmountText(value: estimatedRiskValue(), ticks: effectiveSLTicks(), sign: "-") : "--",
+            valueColor: slEnabled && effectiveSLTicks() > 0 ? palette.red : palette.muted,
+            valueWidth: 54,
+            valueAlignment: .center
+        )
+        let tp = riskSummarySegment(
+            label: "TP",
+            value: tpEnabled ? summaryAmountText(value: estimatedTargetValue(), ticks: effectiveTPTicks(), sign: "+") : "--",
+            valueColor: tpEnabled && effectiveTPTicks() > 0 ? palette.green : palette.muted,
+            valueWidth: 54,
+            valueAlignment: .center
+        )
+        let rr = riskSummarySegment(
+            label: "R:R",
+            value: rrCompactText(),
+            valueColor: tpEnabled && slEnabled && effectiveTPTicks() > 0 ? palette.text : palette.muted,
+            valueWidth: 36,
+            valueAlignment: .center
+        )
+        let leftDivider = text("|", 10, .regular, palette.muted)
+        leftDivider.alignment = .center
+        let rightDivider = text("|", 10, .regular, palette.muted)
+        rightDivider.alignment = .center
 
-        let mid = text("|", 10, .regular, palette.muted)
-        mid.alignment = .center
-
-        let right = hstack(spacing: 5)
-        right.addArrangedSubview(text("R:R", 10, .regular, palette.muted))
-        right.addArrangedSubview(adaptiveDigit("\(rrText())", base: 10, min: 8, weight: .semibold, color: tpEnabled && slEnabled && effectiveTPTicks() > 0 ? palette.text : palette.muted, width: 58, alignment: .right))
-
-        [left, mid, right].forEach {
+        [sl, tp, rr, leftDivider, rightDivider].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             box.addSubview($0)
         }
         NSLayoutConstraint.activate([
-            left.leadingAnchor.constraint(equalTo: box.leadingAnchor),
-            left.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            sl.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+            sl.trailingAnchor.constraint(equalTo: leftDivider.leadingAnchor),
+            sl.centerYAnchor.constraint(equalTo: box.centerYAnchor),
 
-            mid.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-            mid.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            leftDivider.leadingAnchor.constraint(equalTo: sl.trailingAnchor),
+            leftDivider.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            leftDivider.widthAnchor.constraint(equalToConstant: 1),
 
-            right.trailingAnchor.constraint(equalTo: box.trailingAnchor),
-            right.centerYAnchor.constraint(equalTo: box.centerYAnchor)
+            tp.leadingAnchor.constraint(equalTo: leftDivider.trailingAnchor),
+            tp.trailingAnchor.constraint(equalTo: rightDivider.leadingAnchor),
+            tp.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            tp.widthAnchor.constraint(equalTo: sl.widthAnchor),
+
+            rightDivider.leadingAnchor.constraint(equalTo: tp.trailingAnchor),
+            rightDivider.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            rightDivider.widthAnchor.constraint(equalToConstant: 1),
+
+            rr.leadingAnchor.constraint(equalTo: rightDivider.trailingAnchor),
+            rr.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+            rr.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            rr.widthAnchor.constraint(equalTo: sl.widthAnchor)
         ])
         return box
+    }
+
+    func riskSummarySegment(label: String, value: String, valueColor: NSColor, valueWidth: CGFloat, valueAlignment: NSTextAlignment) -> NSView {
+        let view = NSView()
+        let row = hstack(spacing: 4)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.alignment = .centerY
+        view.addSubview(row)
+        let labelView = text(label, 10, .regular, palette.muted)
+        labelView.alignment = .left
+        labelView.fixedWidth(label == "R:R" ? 18 : 13)
+        row.addArrangedSubview(labelView)
+        row.addArrangedSubview(adaptiveDigit(value, base: 9, min: 6.5, weight: .semibold, color: valueColor, width: valueWidth, alignment: valueAlignment))
+        NSLayoutConstraint.activate([
+            row.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            row.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            row.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 2),
+            row.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -2)
+        ])
+        return view
+    }
+
+    func summaryAmountText(value: Double, ticks: Int, sign: String) -> String {
+        let absValue = abs(value)
+        let amount = "\(sign)$\(String(format: "%.0f", absValue))"
+        if absValue >= 10_000 {
+            return amount
+        }
+        return "\(amount)/\(ticks)t"
     }
 
     func estimatedRiskValue() -> Double {
@@ -4978,12 +5450,25 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return Double(orderQty * effectiveSLTicks()) * c.tickValue
     }
 
+    func estimatedTargetValue() -> Double {
+        let c = contracts[selectedSymbol]!
+        return Double(orderQty * effectiveTPTicks()) * c.tickValue
+    }
+
     func estimatedRiskText() -> String {
         guard effectiveSLTicks() > 0 else { return "Invalid" }
         return money(estimatedRiskValue())
     }
 
+    func estimatedTargetText() -> String {
+        guard effectiveTPTicks() > 0 else { return "Invalid" }
+        return money(estimatedTargetValue())
+    }
+
     func riskSummaryText() -> String {
+        if tpEnabled && !slEnabled {
+            return "\(estimatedTargetText()) / \(effectiveTPTicks())t"
+        }
         guard slEnabled else { return "No SL" }
         return "\(estimatedRiskText()) / \(effectiveSLTicks())t"
     }
@@ -4995,6 +5480,14 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         guard sl > 0, tp > 0 else { return "--" }
         let rr = Double(tp) / Double(sl)
         return "\(String(format: "%.2f", rr)) : 1"
+    }
+
+    func rrCompactText() -> String {
+        guard tpEnabled, slEnabled else { return "--" }
+        let sl = effectiveSLTicks()
+        let tp = effectiveTPTicks()
+        guard sl > 0, tp > 0 else { return "--" }
+        return String(format: "%.2f", Double(tp) / Double(sl))
     }
 
     func beginTicketInput(_ field: NSTextField) {
