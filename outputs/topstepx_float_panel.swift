@@ -832,6 +832,7 @@ final class FillBar: NSView {
 final class PillButton: NSButton {
     var bgColor = NSColor.clear
     var fgColor = NSColor.white
+    var visualFeedback = true
 
     private var trackingArea: NSTrackingArea?
     private var hovered = false
@@ -929,7 +930,10 @@ final class PillButton: NSButton {
 
         let lowAlpha = bgColor.alphaComponent < 0.15
 
-        if !isEnabled {
+        if !visualFeedback {
+            targetBg = bgColor
+            targetTint = isEnabled ? fgColor : fgColor.withAlphaComponent(0.42)
+        } else if !isEnabled {
             targetBg = bgColor.withAlphaComponent(0.32)
             targetTint = fgColor.withAlphaComponent(0.42)
         } else if pressed {
@@ -985,7 +989,7 @@ final class PillButton: NSButton {
             self.contentTintColor = targetTint
         }
 
-        if hovered && !lowAlpha {
+        if visualFeedback && hovered && !lowAlpha {
             layer.borderWidth = 1
             layer.borderColor = fgColor.withAlphaComponent(0.3).cgColor
         } else if !hovered {
@@ -999,6 +1003,140 @@ final class PillButton: NSButton {
             baseBorderWidth = l.borderWidth
             baseBorderColor = l.borderColor
         }
+    }
+}
+
+final class HoverPopUpButton: NSPopUpButton {
+    var normalBackgroundColor = NSColor.clear
+    var hoverBackgroundColor = NSColor.clear
+    var normalBorderColor = NSColor.clear
+    var hoverBorderColor = NSColor.clear
+
+    private var trackingArea: NSTrackingArea?
+    private var hovered = false
+
+    init() {
+        super.init(frame: .zero, pullsDown: false)
+        setupTracking()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configureHover(normalBg: NSColor, hoverBg: NSColor, normalBorder: NSColor, hoverBorder: NSColor) {
+        normalBackgroundColor = normalBg
+        hoverBackgroundColor = hoverBg
+        normalBorderColor = normalBorder
+        hoverBorderColor = hoverBorder
+        applyHoverState(animated: false)
+    }
+
+    private func setupTracking() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea!)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        setupTracking()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isEnabled {
+            addCursorRect(bounds, cursor: .pointingHand)
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        hovered = true
+        applyHoverState(animated: true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        hovered = false
+        applyHoverState(animated: true)
+    }
+
+    private func applyHoverState(animated: Bool) {
+        guard let layer else { return }
+        layer.removeAllAnimations()
+        let bg = hovered ? hoverBackgroundColor : normalBackgroundColor
+        let border = hovered ? hoverBorderColor : normalBorderColor
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(!animated)
+        CATransaction.setAnimationDuration(0.09)
+        layer.backgroundColor = bg.cgColor
+        layer.borderColor = border.cgColor
+        CATransaction.commit()
+    }
+}
+
+final class HoverProxyButton: NSButton {
+    var onHoverChanged: ((Bool) -> Void)?
+    private var trackingArea: NSTrackingArea?
+
+    init() {
+        super.init(frame: .zero)
+        title = ""
+        isBordered = false
+        setButtonType(.momentaryPushIn)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        setupTracking()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private func setupTracking() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea!)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        setupTracking()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isEnabled {
+            addCursorRect(bounds, cursor: .pointingHand)
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        if isEnabled {
+            onHoverChanged?(true)
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        onHoverChanged?(false)
     }
 }
 
@@ -1373,6 +1511,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     var realtimeOpenPositionCount: Int?
     var realtimeTradeCount: Int?
     var realtimeOrders: [Int: [String: Any]] = [:]
+    var realtimeClosedOrderIds: Set<Int> = []
     var realtimePositions: [Int: [String: Any]] = [:]
     var protectionOrderGroups: [Int: String] = [:]
     var protectionGroupOrders: [String: Set<Int>] = [:]
@@ -1387,6 +1526,11 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     private var protectionOrderType: [Int: Int] = [:]  // id -> 1 TP, 4 SL etc for sound decision on fills
     private var protectionOrderKind: [Int: String] = [:]  // id -> TP or SL from local submit intent
     private var lastProtectionFillSound: (id: Int, time: Date)?
+    private var recentFillSoundKeys: [String: Date] = [:]
+    private var lastAnyFillSoundAt: Date = .distantPast
+    private var knownSnapshotTradeSoundKeys: Set<String>?
+    private var snapshotTradeSoundAccountId: Int?
+    private var suppressSnapshotFillSoundsUntil: Date?
     private var customSoundsLoadErrorReported = false
     var hasRealtimeOrderState = false
     var accountRoleText = "LEAD UNSET"
@@ -1696,7 +1840,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     func accountCard() -> NSView {
         let box = vstack(spacing: 6)
         let top = hstack(spacing: 5)
-        let account = NSPopUpButton()
+        let account = HoverPopUpButton()
         var selectedAccountTitle = hideAccount ? anonymizedAccountName(accountName) : accountName
         if activeAccounts.isEmpty {
             account.addItems(withTitles: [selectedAccountTitle])
@@ -1714,8 +1858,9 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         account.target = self
         account.action = #selector(accountChanged(_:))
         stylePopup(account)
-        account.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        account.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
         account.fixedWidth(accountPopupWidth(selectedAccountTitle, font: account.font ?? NSFont.systemFont(ofSize: 10, weight: .semibold)))
+        account.fixedHeight(22)
         top.addArrangedSubview(account)
         top.addArrangedSubview(spacer())
 
@@ -1727,7 +1872,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
         // Account privacy / anonymize toggle (masks last digits of account names for screenshots etc.)
         let anonTitle = hideAccount ? "🙈" : "👁"
-        let anonBtn = PillButton(anonTitle, bg: alpha(palette.text, isDark ? 0.08 : 0.05), fg: palette.muted, size: 10, hoverable: false)
+        let anonBtn = PillButton(anonTitle, bg: alpha(palette.text, isDark ? 0.08 : 0.05), fg: palette.muted, size: 10)
         anonBtn.fixedWidth(22)
         anonBtn.fixedHeight(18)
         anonBtn.target = self
@@ -1744,13 +1889,15 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         let balanceLabel = text("BALANCE", 7, .medium, palette.muted)
         balanceLabel.alignment = .left
         balance.addArrangedSubview(balanceLabel)
-        let balanceButton = PillButton(displayBalanceText(), bg: NSColor.clear, fg: palette.text, size: 12, hoverable: false)
+        let balanceButton = PillButton(displayBalanceText(), bg: NSColor.clear, fg: palette.text, size: 12)
         balanceButton.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
         balanceButton.alignment = .left
         balanceButton.target = self
         balanceButton.action = #selector(toggleBalancePrivacy)
+        balanceButton.visualFeedback = false
         balanceButton.fixedHeight(18)
-        balanceButton.fixedWidth(112)
+        balanceButton.fixedWidth(privacyPillWidth(displayBalanceText(), font: balanceButton.font ?? NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold), min: 62, max: 112))
+        balanceButton.layer?.cornerRadius = 6
         balanceButton.imagePosition = .noImage
         balanceButton.toolTip = hideBalance ? "Show balance" : "Hide balance"
         balance.addArrangedSubview(balanceButton)
@@ -1780,7 +1927,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         let isFlat = !hasCurrentPos
         let side = positionSideText()
         let sideColor = side == "SHORT" ? palette.red : (isFlat ? palette.muted : palette.green)
-        let sidePill = PillButton(side, bg: alpha(sideColor, 0.14), fg: sideColor, size: 8)
+        let sidePill = PillButton(side, bg: alpha(sideColor, 0.14), fg: sideColor, size: 8, hoverable: false)
         sidePill.fixedHeight(18)
         top.addArrangedSubview(sidePill)
 
@@ -1797,7 +1944,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         let details = hstack(spacing: 10)
         details.addArrangedSubview(inlineMetric("Avg", averagePriceText(), width: 60))
         details.addArrangedSubview(divider())
-        details.addArrangedSubview(privacyMetric("RP&L", displayRealizedPnlText(), width: 58, valueColor: displayRealizedPnlColor(), action: #selector(toggleRealizedPnlPrivacy), hidden: hideRealizedPnl))
+        details.addArrangedSubview(privacyMetric("RP&L", displayRealizedPnlText(), width: 52, valueColor: displayRealizedPnlColor(), action: #selector(toggleRealizedPnlPrivacy), hidden: hideRealizedPnl))
         details.addArrangedSubview(divider())
         details.addArrangedSubview(inlineMetric("Protect", protectionStatusText(), width: 64))
         details.addArrangedSubview(spacer())
@@ -1993,9 +2140,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     func orderDataSourcePill() -> NSView {
         let live = hasRealtimeOrderState
-        let dot = text("●", 7, .semibold, live ? palette.green : palette.muted)
-        let label = text(live ? "STREAM" : "REST", 7.5, .semibold, live ? palette.text : palette.muted)
-        let detail = text(live ? "live" : "snapshot", 7.5, .medium, alpha(palette.muted, 0.82))
+        let restFailed = snapshotStatusText.lowercased().contains("failed") || snapshotStatusText.lowercased().contains("off")
+        let restLoading = !live && lastSnapshot == nil
+        let statusColor: NSColor = live ? palette.green : (restFailed ? palette.red : (restLoading ? palette.orange : palette.green))
+        let dot = text("●", 7, .semibold, statusColor)
+        let label = text(live ? "STREAM" : "REST", 7.5, .semibold, live ? palette.text : (restFailed ? palette.red : palette.text))
+        let detail = text(live ? "live" : (restFailed ? "failed" : (restLoading ? "loading" : "snapshot")), 7.5, .medium, alpha(restFailed ? palette.red : palette.muted, restFailed ? 0.92 : 0.82))
         let row = hstack(spacing: 4)
         row.edgeInsets = NSEdgeInsets(top: 0, left: 7, bottom: 0, right: 7)
         row.addArrangedSubview(dot)
@@ -2003,9 +2153,9 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         row.addArrangedSubview(detail)
         row.wantsLayer = true
         row.layer?.cornerRadius = 8
-        row.layer?.backgroundColor = alpha(live ? palette.green : palette.text, live ? 0.10 : 0.055).cgColor
+        row.layer?.backgroundColor = alpha(statusColor, live ? 0.10 : (restFailed ? 0.10 : 0.07)).cgColor
         row.layer?.borderWidth = 1
-        row.layer?.borderColor = alpha(live ? palette.green : palette.border, live ? 0.22 : 0.38).cgColor
+        row.layer?.borderColor = alpha(statusColor, live ? 0.22 : 0.26).cgColor
         row.fixedHeight(17)
         return row
     }
@@ -2232,7 +2382,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     func riskActionButton(_ title: String, color: NSColor, active: Bool) -> NSButton {
         let fg = active ? color : palette.muted
-        let button = PillButton(title, bg: active ? alpha(color, 0.10) : alpha(palette.text, isDark ? 0.04 : 0.08), fg: fg, size: 9, hoverable: false)
+        let button = PillButton(title, bg: active ? alpha(color, 0.10) : alpha(palette.text, isDark ? 0.04 : 0.08), fg: fg, size: 9, hoverable: active)
         button.fixedHeight(24)
         button.layer?.cornerRadius = 7
         button.layer?.borderWidth = 1
@@ -2322,7 +2472,16 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     }
 
     func workingOrders() -> [[String: Any]] {
-        let source = hasRealtimeOrderState ? Array(realtimeOrders.values) : (lastSnapshot?.openOrders ?? [])
+        var byId: [Int: [String: Any]] = [:]
+        for order in lastSnapshot?.openOrders ?? [] {
+            guard let id = intValue(order["id"]),
+                  !realtimeClosedOrderIds.contains(id) else { continue }
+            byId[id] = order
+        }
+        for (id, order) in realtimeOrders {
+            byId[id] = order
+        }
+        let source = Array(byId.values)
         return source.sorted {
             (intValue($0["id"]) ?? 0) < (intValue($1["id"]) ?? 0)
         }
@@ -2463,6 +2622,9 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
 
         showTradeToast(title, subtitle: subtitle, color: status == 3 ? palette.orange : color)
+        if status == 2 {
+            markFillSoundPlayed(key: "order-\(id)")
+        }
     }
 
     func isTakeProfitFill(_ order: [String: Any]) -> Bool {
@@ -2574,6 +2736,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
                 // cleanly when the official platform does (instead of mixing yesterday's trades via old -24h).
                 self.officialRealizedDayPnl = self.realizedPnlFromTrades(snapshot.trades) ?? snapshot.realizedDayPnl
                 self.officialUnrealizedPnl = snapshot.unrealizedPnl
+                self.syncSnapshotTradeFillSounds(snapshot.trades, accountId: snapshot.accountId)
                 self.applySnapshotPositions(snapshot.openPositions)
                 self.reconcileProtectionGroups(openOrders: snapshot.openOrders, openPositionCount: snapshot.openPositionCount)
                 if let contractId = snapshot.contractId {
@@ -3013,24 +3176,27 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     }
 
     func applyRealtimeOrder(_ order: [String: Any]) {
-        guard payloadAccountId(order) == selectedAccountId,
-              let id = order["id"] as? Int ?? (order["id"] as? NSNumber)?.intValue else { return }
+        let payload = orderDataPayload(order)
+        guard realtimeOrderBelongsToSelectedAccount(payload),
+              let id = intValue(payload["id"]) else { return }
         hasRealtimeOrderState = true
         let previous = realtimeOrders[id]
-        let status = order["status"] as? Int ?? (order["status"] as? NSNumber)?.intValue
+        let status = intValue(payload["status"])
         if status == 1 || status == 6 {
-            realtimeOrders[id] = order
+            realtimeOrders[id] = payload
+            realtimeClosedOrderIds.remove(id)
         } else {
             realtimeOrders.removeValue(forKey: id)
+            realtimeClosedOrderIds.insert(id)
             clearEditingOrder(orderId: id)
         }
         // Record type for protection orders so we can decide TP vs SL sound even if fill toast is for protection.
         if protectionOrderGroups[id] != nil {
-            if let otype = intValue(order["type"]) ?? (order["type"] as? NSNumber)?.intValue {
+            if let otype = intValue(payload["type"]) {
                 protectionOrderType[id] = otype
             }
         }
-        showRealtimeOrderToast(order, previous: previous)
+        showRealtimeOrderToast(payload, previous: previous)
         handleProtectionOrderUpdate(orderId: id, status: status)
         if let status, status == 2 || status == 3 || status == 4 || status == 5 {
             submittedEntryOrderIds.remove(id)
@@ -3042,6 +3208,18 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         lastSyncText = "Last \(timeStamp())"
         updateFooterStatus()
         scheduleRebuild()
+    }
+
+    func orderDataPayload(_ order: [String: Any]) -> [String: Any] {
+        return order["data"] as? [String: Any] ?? order
+    }
+
+    func realtimeOrderBelongsToSelectedAccount(_ order: [String: Any]) -> Bool {
+        if let payloadId = payloadAccountId(order) {
+            return payloadId == selectedAccountId
+        }
+        // GatewayUserOrder is subscribed per account, and some payloads may omit accountId.
+        return realtimeAccountId != nil && realtimeAccountId == selectedAccountId
     }
 
     func handleProtectionOrderUpdate(orderId: Int, status: Int?) {
@@ -3058,15 +3236,15 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             let now = Date()
             if lastProtectionFillSound?.id != orderId || now.timeIntervalSince(lastProtectionFillSound!.time) > 1 {
                 if protectionOrderKind[orderId] == "TP" {
-                    playSoundFile("TP")
+                    playFillSoundFile("TP")
                 } else if let otype = protectionOrderType[orderId] {
                     if otype == 1 {
-                        playSoundFile("TP")
+                        playFillSoundFile("TP")
                     } else {
-                        playSoundFile("Order")
+                        playFillSoundFile("Order")
                     }
                 } else {
-                    playSoundFile("Order")
+                    playFillSoundFile("Order")
                 }
                 lastProtectionFillSound = (orderId, now)
             }
@@ -3164,8 +3342,10 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     }
 
     func applyRealtimeTrade(_ trade: [String: Any]) {
-        guard payloadAccountId(trade) == selectedAccountId else { return }
+        guard realtimeTradeBelongsToSelectedAccount(trade) else { return }
         if trade["voided"] as? Bool == true { return }
+
+        playRealtimeTradeFillSoundIfNeeded(trade)
 
         realtimeTradeCount = (realtimeTradeCount ?? 0) + 1
 
@@ -3187,6 +3367,85 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         scheduleRebuild()
     }
 
+    func realtimeTradeBelongsToSelectedAccount(_ trade: [String: Any]) -> Bool {
+        if let payloadId = payloadAccountId(trade) {
+            return payloadId == selectedAccountId
+        }
+        // GatewayUserTrade is subscribed per account, and some payloads do not carry accountId.
+        // In that case, trust the active user-hub subscription identity.
+        return realtimeAccountId != nil && realtimeAccountId == selectedAccountId
+    }
+
+    func playRealtimeTradeFillSoundIfNeeded(_ trade: [String: Any]) {
+        let key = realtimeTradeFillSoundKey(trade)
+        guard shouldPlayFillSound(key: key) else { return }
+        let orderId = intValue(trade["orderId"])
+            ?? intValue(trade["orderID"])
+            ?? intValue(trade["order_id"])
+            ?? intValue(trade["order"])
+        if let orderId, protectionOrderKind[orderId] == "TP" {
+            playFillSoundFile("TP")
+        } else {
+            playFillSoundFile("Order")
+        }
+        markFillSoundPlayed(key: key)
+    }
+
+    func realtimeTradeFillSoundKey(_ trade: [String: Any]) -> String {
+        if let orderId = intValue(trade["orderId"])
+            ?? intValue(trade["orderID"])
+            ?? intValue(trade["order_id"])
+            ?? intValue(trade["order"]) {
+            return "order-\(orderId)"
+        }
+        if let tradeId = intValue(trade["id"]) ?? intValue(trade["tradeId"]) ?? intValue(trade["tradeID"]) {
+            return "trade-\(tradeId)"
+        }
+        let contract = trade["contractId"] as? String ?? activeContractId() ?? selectedSymbol
+        let timestamp = (trade["creationTimestamp"] as? String)
+            ?? (trade["timestamp"] as? String)
+            ?? (trade["updateTimestamp"] as? String)
+            ?? timeStamp()
+        let price = numberValue(trade["price"]) ?? numberValue(trade["fillPrice"]) ?? numberValue(trade["executionPrice"]) ?? 0
+        let size = intValue(trade["size"]) ?? intValue(trade["qty"]) ?? intValue(trade["quantity"]) ?? 0
+        let side = intValue(trade["side"]) ?? intValue(trade["type"]) ?? -1
+        return "trade-\(contract)-\(timestamp)-\(price)-\(size)-\(side)"
+    }
+
+    func syncSnapshotTradeFillSounds(_ trades: [[String: Any]], accountId: Int?) {
+        guard let accountId else { return }
+        let keys = Set(trades.compactMap { trade -> String? in
+            if trade["voided"] as? Bool == true { return nil }
+            return realtimeTradeFillSoundKey(trade)
+        })
+
+        guard snapshotTradeSoundAccountId == accountId,
+              knownSnapshotTradeSoundKeys != nil else {
+            snapshotTradeSoundAccountId = accountId
+            knownSnapshotTradeSoundKeys = keys
+            return
+        }
+
+        // REST /Trade/search is authoritative for RP&L reconciliation, but it can arrive
+        // seconds after the actual fill. Do not play delayed fill sounds from this snapshot;
+        // sounds should come from realtime trade/order events or direct user actions.
+        suppressSnapshotFillSoundsUntil = nil
+        knownSnapshotTradeSoundKeys = keys
+    }
+
+    func shouldPlayFillSound(key: String) -> Bool {
+        let now = Date()
+        recentFillSoundKeys = recentFillSoundKeys.filter { now.timeIntervalSince($0.value) < 5 }
+        if let previous = recentFillSoundKeys[key], now.timeIntervalSince(previous) < 2 {
+            return false
+        }
+        return true
+    }
+
+    func markFillSoundPlayed(key: String) {
+        recentFillSoundKeys[key] = Date()
+    }
+
     func payloadAccountId(_ payload: [String: Any]) -> Int? {
         return payload["accountId"] as? Int
             ?? (payload["accountId"] as? NSNumber)?.intValue
@@ -3199,6 +3458,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         realtimeOpenPositionCount = nil
         realtimeTradeCount = nil
         realtimeOrders.removeAll()
+        realtimeClosedOrderIds.removeAll()
         realtimePositions.removeAll()
         hasRealtimeOrderState = false
         officialRealizedDayPnl = nil
@@ -3975,6 +4235,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
                 case .success:
                     self.eventLabel?.stringValue = "FLATTEN SENT: \(self.selectedSymbol)"
                     self.eventLabel?.textColor = self.palette.green
+                    self.suppressSnapshotFillSoundsUntil = Date().addingTimeInterval(5)
                     self.showTradeToast("Flatten sent", subtitle: self.selectedSymbol, color: self.palette.red)
                     self.refreshAfterTradeMutation()
                 }
@@ -4193,17 +4454,41 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     func privacyMetric(_ name: String, _ value: String, width: CGFloat, valueColor: NSColor, action: Selector, hidden: Bool) -> NSView {
         let row = hstack(spacing: 4)
         row.addArrangedSubview(text(name, 8, .regular, palette.muted))
-        let button = PillButton(value, bg: NSColor.clear, fg: valueColor, size: 10, hoverable: false)
-        button.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
-        button.alignment = .left
-        button.fixedWidth(width)
-        button.fixedHeight(14)
-        button.target = self
-        button.action = action
-        button.imagePosition = .noImage
-        button.toolTip = hidden ? "Show \(name)" : "Hide \(name)"
-        row.addArrangedSubview(button)
+        let slot = NSView()
+        slot.fixedWidth(width)
+        slot.fixedHeight(14)
+
+        let label = digit(value, adaptiveSize(for: value, base: 10, min: 8), .semibold, valueColor)
+        label.alignment = .left
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let hit = HoverProxyButton()
+        hit.target = self
+        hit.action = action
+        hit.toolTip = hidden ? "Show \(name)" : "Hide \(name)"
+        hit.translatesAutoresizingMaskIntoConstraints = false
+
+        slot.addSubview(label)
+        slot.addSubview(hit)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: slot.leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: slot.trailingAnchor),
+            label.centerYAnchor.constraint(equalTo: slot.centerYAnchor),
+            hit.leadingAnchor.constraint(equalTo: slot.leadingAnchor),
+            hit.trailingAnchor.constraint(equalTo: slot.trailingAnchor),
+            hit.topAnchor.constraint(equalTo: slot.topAnchor),
+            hit.bottomAnchor.constraint(equalTo: slot.bottomAnchor)
+        ])
+
+        row.addArrangedSubview(slot)
         return row
+    }
+
+    func privacyPillWidth(_ value: String, font: NSFont, min: CGFloat, max: CGFloat) -> CGFloat {
+        let textWidth = (value as NSString).size(withAttributes: [.font: font]).width
+        return Swift.min(Swift.max(ceil(textWidth + 12), min), max)
     }
 
     func displayBalanceText() -> String {
@@ -4633,15 +4918,19 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         modeControl.layer?.backgroundColor = alpha(palette.surface2, isDark ? 0.72 : 0.90).cgColor
 
         let priceProtectionReady = !(quoteSyncing && bracketMode == "PRICE")
-        let tp = compactField(bracketMode == "PRICE" ? "TP price" : "TP ticks", bracketValueText(kind: "TP"), id: "bracketTP", enabled: tpEnabled && priceProtectionReady)
-        let sl = compactField(bracketMode == "PRICE" ? "SL price" : "SL ticks", bracketValueText(kind: "SL"), id: "bracketSL", enabled: slEnabled && priceProtectionReady)
+        let tpDisplayActive = tpEnabled || officialProtectionPrice(kind: "TP") != nil
+        let slDisplayActive = slEnabled || officialProtectionPrice(kind: "SL") != nil
+        let tp = compactField(bracketMode == "PRICE" ? "TP price" : "TP ticks", bracketValueText(kind: "TP"), id: "bracketTP", enabled: tpDisplayActive && priceProtectionReady)
+        let sl = compactField(bracketMode == "PRICE" ? "SL price" : "SL ticks", bracketValueText(kind: "SL"), id: "bracketSL", enabled: slDisplayActive && priceProtectionReady)
         let tpCheck = protectionToggle(title: "TP", enabled: tpEnabled, action: #selector(toggleTPProtection))
         let slCheck = protectionToggle(title: "SL", enabled: slEnabled, action: #selector(toggleSLProtection))
         let fieldWidth = bracketInputWidth()
         let tpPanel = protectionPanel(color: palette.green, active: tpEnabled)
         let slPanel = protectionPanel(color: palette.red, active: slEnabled)
+        let tpHit = protectionPanelHitButton(panel: tpPanel, color: palette.green, active: tpEnabled, action: #selector(toggleTPProtection))
+        let slHit = protectionPanelHitButton(panel: slPanel, color: palette.red, active: slEnabled, action: #selector(toggleSLProtection))
 
-        [modeControl, tpPanel, slPanel, tpCheck, slCheck, tp, sl].forEach {
+        [modeControl, tpPanel, slPanel, tpCheck, slCheck, tp, sl, tpHit, slHit].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             box.addSubview($0)
         }
@@ -4682,7 +4971,17 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             tp.widthAnchor.constraint(equalToConstant: fieldWidth),
             sl.centerXAnchor.constraint(equalTo: slPanel.centerXAnchor),
             sl.topAnchor.constraint(equalTo: tp.topAnchor),
-            sl.widthAnchor.constraint(equalToConstant: fieldWidth)
+            sl.widthAnchor.constraint(equalToConstant: fieldWidth),
+
+            tpHit.leadingAnchor.constraint(equalTo: tpPanel.leadingAnchor),
+            tpHit.trailingAnchor.constraint(equalTo: tpPanel.trailingAnchor),
+            tpHit.topAnchor.constraint(equalTo: tpPanel.topAnchor),
+            tpHit.bottomAnchor.constraint(equalTo: tp.topAnchor, constant: 13),
+
+            slHit.leadingAnchor.constraint(equalTo: slPanel.leadingAnchor),
+            slHit.trailingAnchor.constraint(equalTo: slPanel.trailingAnchor),
+            slHit.topAnchor.constraint(equalTo: slPanel.topAnchor),
+            slHit.bottomAnchor.constraint(equalTo: sl.topAnchor, constant: 13)
         ])
 
         return box
@@ -4696,6 +4995,28 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         panel.layer?.borderWidth = 1
         panel.layer?.borderColor = alpha(color, active ? 0.62 : 0.16).cgColor
         return panel
+    }
+
+    func protectionPanelHitButton(panel: NSView, color: NSColor, active: Bool, action: Selector) -> HoverProxyButton {
+        let button = HoverProxyButton()
+        button.target = self
+        button.action = action
+        button.toolTip = active ? "Disable protection" : "Enable protection"
+
+        let normalBg = alpha(color, active ? (isDark ? 0.10 : 0.06) : (isDark ? 0.025 : 0.04))
+        let hoverBg = alpha(color, active ? (isDark ? 0.16 : 0.10) : (isDark ? 0.075 : 0.08))
+        let normalBorder = alpha(color, active ? 0.62 : 0.16)
+        let hoverBorder = alpha(color, active ? 0.88 : 0.42)
+
+        button.onHoverChanged = { [weak panel] hovering in
+            guard let layer = panel?.layer else { return }
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.08)
+            layer.backgroundColor = (hovering ? hoverBg : normalBg).cgColor
+            layer.borderColor = (hovering ? hoverBorder : normalBorder).cgColor
+            CATransaction.commit()
+        }
+        return button
     }
 
     func bracketInputWidth() -> CGFloat {
@@ -4742,10 +5063,76 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         if kind == "SL", let value = slPriceOverride {
             return number2(value)
         }
+        if bracketMode == "PRICE", let official = officialProtectionPrice(kind: kind) {
+            return number2(official)
+        }
         if isOppositeOpenPositionOrder(side: orderSide) {
             return number2(positionProtectionPrice(kind: kind))
         }
         return number2(bracketPrice(kind: kind))
+    }
+
+    func officialProtectionOrder(kind: String) -> [String: Any]? {
+        guard let position = activePosition(),
+              let posContractId = position["contractId"] as? String else { return nil }
+        let posSide = positionSideText()
+        guard posSide == "LONG" || posSide == "SHORT" else { return nil }
+        let exitSide = posSide == "SHORT" ? "BUY" : "SELL"
+        let avg = numberValue(position["averagePrice"])
+        let candidates = workingOrders().filter { order in
+            guard (order["contractId"] as? String) == posContractId,
+                  orderSideText(order) == exitSide,
+                  let type = intValue(order["type"]),
+                  let price = officialProtectionOrderPrice(order, kind: kind) else { return false }
+            if kind == "TP" {
+                guard type == 1 else { return false }
+                if let avg {
+                    return posSide == "SHORT" ? price < avg : price > avg
+                }
+                return true
+            }
+            guard type == 3 || type == 4 || type == 5 else { return false }
+            if let avg {
+                return posSide == "SHORT" ? price > avg : price < avg
+            }
+            return true
+        }
+        return candidates.sorted {
+            let a = officialProtectionOrderPrice($0, kind: kind) ?? 0
+            let b = officialProtectionOrderPrice($1, kind: kind) ?? 0
+            if let avg {
+                return abs(a - avg) < abs(b - avg)
+            }
+            return (intValue($0["id"]) ?? 0) > (intValue($1["id"]) ?? 0)
+        }.first
+    }
+
+    func officialProtectionOrderPrice(_ order: [String: Any], kind: String) -> Double? {
+        if kind == "TP" {
+            return numberValue(order["limitPrice"]) ?? numberValue(order["stopPrice"]) ?? numberValue(order["trailPrice"])
+        }
+        return numberValue(order["stopPrice"]) ?? numberValue(order["limitPrice"]) ?? numberValue(order["trailPrice"])
+    }
+
+    func officialProtectionPrice(kind: String) -> Double? {
+        if kind == "TP", activeTicketInput == "bracketTP" { return nil }
+        if kind == "SL", activeTicketInput == "bracketSL" { return nil }
+        guard bracketMode == "PRICE" else { return nil }
+        if editingProtectionKind() == kind, let value = limitPriceOverride {
+            return value
+        }
+        guard let order = officialProtectionOrder(kind: kind) else { return nil }
+        return officialProtectionOrderPrice(order, kind: kind)
+    }
+
+    func editingProtectionKind() -> String? {
+        guard editingOrderId != nil,
+              let type = editingOrderType,
+              let side = editingOrderSide,
+              isOppositeOpenPositionOrder(side: side) else { return nil }
+        if type == 1 { return "TP" }
+        if type == 3 || type == 4 || type == 5 { return "SL" }
+        return nil
     }
 
     func bidPrice() -> Double {
@@ -5046,14 +5433,18 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         // These toasts have "Filled" in title.
         if combined.contains("filled") && lastProtectionFillWasTP {
             lastProtectionFillWasTP = false
-            playSoundFile("TP")
+            playFillSoundFile("TP")
+            return
+        }
+
+        if combined.contains("filled") {
+            playFillSoundFile("Order")
             return
         }
 
         // Trigger sound for market quick entries, limit entries, fills, SL, protection TP/SL sent, cancels, etc.
         // "accepted" and "sent" often live in the subtitle for placeOrder success path.
-        let shouldPlay = combined.contains("filled")
-            || combined.contains("rejected") || combined.contains("expired")
+        let shouldPlay = combined.contains("rejected") || combined.contains("expired")
             || combined.contains("canceled")
             || combined.contains("sent") || combined.contains("accepted")
             || combined.contains("modify") || combined.contains("protection") || combined.contains("flatten")
@@ -5087,6 +5478,19 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         s.stop()
         s.currentTime = 0
         s.play()
+    }
+
+    @discardableResult
+    private func playFillSoundFile(_ kind: String) -> Bool {
+        let now = Date()
+        if now.timeIntervalSince(lastAnyFillSoundAt) < 0.9 {
+            suppressSnapshotFillSoundsUntil = now.addingTimeInterval(5)
+            return false
+        }
+        lastAnyFillSoundAt = now
+        suppressSnapshotFillSoundsUntil = now.addingTimeInterval(5)
+        playSoundFile(kind)
+        return true
     }
 
     private func ensureSound(_ kind: String) -> NSSound? {
@@ -5335,15 +5739,29 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     func accountPopupWidth(_ value: String, font: NSFont) -> CGFloat {
         let textWidth = (value as NSString).size(withAttributes: [.font: font]).width
-        return min(max(ceil(textWidth + 32), 96), 138)
+        return min(max(ceil(textWidth + 32), 104), 138)
     }
 
     func stylePopup(_ popup: NSPopUpButton) {
         popup.isBordered = false
         popup.contentTintColor = palette.text
         popup.wantsLayer = true
-        popup.layer?.cornerRadius = 6
-        popup.layer?.backgroundColor = palette.surface2.cgColor
+        popup.layer?.cornerRadius = 8
+        popup.layer?.borderWidth = 1
+        let normalBg = alpha(palette.surface2, isDark ? 0.70 : 0.92)
+        let hoverBg = alpha(palette.surface2, isDark ? 0.98 : 1.0)
+        let normalBorder = alpha(palette.border, isDark ? 0.20 : 0.28)
+        let hoverBorder = alpha(palette.blue, isDark ? 0.42 : 0.34)
+        popup.layer?.backgroundColor = normalBg.cgColor
+        popup.layer?.borderColor = normalBorder.cgColor
+        if let hoverPopup = popup as? HoverPopUpButton {
+            hoverPopup.configureHover(
+                normalBg: normalBg,
+                hoverBg: hoverBg,
+                normalBorder: normalBorder,
+                hoverBorder: hoverBorder
+            )
+        }
     }
 
     func hstackText(_ items: [(String, NSColor)]) -> NSStackView {
@@ -5359,25 +5777,31 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     func ticketRiskSummary() -> NSView {
         let box = NSView()
+        let slActive = protectionDisplayActive(kind: "SL")
+        let tpActive = protectionDisplayActive(kind: "TP")
+        let slTicks = protectionDisplayTicks(kind: "SL")
+        let tpTicks = protectionDisplayTicks(kind: "TP")
+        let slAmount = protectionDisplaySignedAmount(kind: "SL")
+        let tpAmount = protectionDisplaySignedAmount(kind: "TP")
 
         let sl = riskSummarySegment(
             label: "SL",
-            value: slEnabled ? summaryAmountText(value: estimatedRiskValue(), ticks: effectiveSLTicks(), sign: "-") : "--",
-            valueColor: slEnabled && effectiveSLTicks() > 0 ? palette.red : palette.muted,
+            value: slActive ? summarySignedAmountText(value: slAmount, ticks: slTicks) : "--",
+            valueColor: slActive ? (slAmount >= 0 ? palette.green : palette.red) : palette.muted,
             valueWidth: 54,
             valueAlignment: .center
         )
         let tp = riskSummarySegment(
             label: "TP",
-            value: tpEnabled ? summaryAmountText(value: estimatedTargetValue(), ticks: effectiveTPTicks(), sign: "+") : "--",
-            valueColor: tpEnabled && effectiveTPTicks() > 0 ? palette.green : palette.muted,
+            value: tpActive ? summarySignedAmountText(value: tpAmount, ticks: tpTicks) : "--",
+            valueColor: tpActive ? (tpAmount >= 0 ? palette.green : palette.red) : palette.muted,
             valueWidth: 54,
             valueAlignment: .center
         )
         let rr = riskSummarySegment(
             label: "R:R",
             value: rrCompactText(),
-            valueColor: tpEnabled && slEnabled && effectiveTPTicks() > 0 ? palette.text : palette.muted,
+            valueColor: tpActive && slActive && tpTicks > 0 ? palette.text : palette.muted,
             valueWidth: 36,
             valueAlignment: .center
         )
@@ -5445,6 +5869,11 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return "\(amount)/\(ticks)t"
     }
 
+    func summarySignedAmountText(value: Double, ticks: Int) -> String {
+        let sign = value >= 0 ? "+" : "-"
+        return summaryAmountText(value: value, ticks: ticks, sign: sign)
+    }
+
     func estimatedRiskValue() -> Double {
         let c = contracts[selectedSymbol]!
         return Double(orderQty * effectiveSLTicks()) * c.tickValue
@@ -5453,6 +5882,69 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     func estimatedTargetValue() -> Double {
         let c = contracts[selectedSymbol]!
         return Double(orderQty * effectiveTPTicks()) * c.tickValue
+    }
+
+    func protectionDisplayActive(kind: String) -> Bool {
+        if kind == "TP" {
+            return tpEnabled || officialProtectionPrice(kind: "TP") != nil
+        }
+        return slEnabled || officialProtectionPrice(kind: "SL") != nil
+    }
+
+    func protectionDisplayTicks(kind: String) -> Int {
+        if kind == "TP", tpEnabled {
+            return effectiveTPTicks()
+        }
+        if kind == "SL", slEnabled {
+            return effectiveSLTicks()
+        }
+        guard let price = officialProtectionPrice(kind: kind) else {
+            return kind == "TP" ? effectiveTPTicks() : effectiveSLTicks()
+        }
+        return ticksFromPrice(kind: kind, value: price)
+    }
+
+    func protectionDisplayAmount(kind: String) -> Double {
+        let spec = contractSpec(for: activePosition()?["contractId"] as? String) ?? (contracts[selectedSymbol]!.tick, contracts[selectedSymbol]!.tickValue)
+        return Double(protectionDisplayQty(kind: kind) * protectionDisplayTicks(kind: kind)) * spec.1
+    }
+
+    func protectionDisplaySignedAmount(kind: String) -> Double {
+        guard let position = activePosition(),
+              let avg = numberValue(position["averagePrice"]),
+              let price = protectionDisplayPrice(kind: kind) else {
+            return kind == "TP" ? protectionDisplayAmount(kind: kind) : -protectionDisplayAmount(kind: kind)
+        }
+        let spec = contractSpec(for: position["contractId"] as? String) ?? (contracts[selectedSymbol]!.tick, contracts[selectedSymbol]!.tickValue)
+        let qty = protectionDisplayQty(kind: kind)
+        let ticks: Int
+        if positionSideText() == "SHORT" {
+            ticks = Int(((avg - price) / spec.0).rounded())
+        } else {
+            ticks = Int(((price - avg) / spec.0).rounded())
+        }
+        return Double(qty * ticks) * spec.1
+    }
+
+    func protectionDisplayPrice(kind: String) -> Double? {
+        if let official = officialProtectionPrice(kind: kind) {
+            return official
+        }
+        if kind == "TP", tpEnabled {
+            return bracketMode == "PRICE" ? tpPriceOverride ?? positionProtectionPrice(kind: "TP") : bracketPrice(kind: "TP")
+        }
+        if kind == "SL", slEnabled {
+            return bracketMode == "PRICE" ? slPriceOverride ?? positionProtectionPrice(kind: "SL") : bracketPrice(kind: "SL")
+        }
+        return nil
+    }
+
+    func protectionDisplayQty(kind: String) -> Int {
+        if let order = officialProtectionOrder(kind: kind),
+           let size = intValue(order["size"]) {
+            return max(1, abs(size))
+        }
+        return max(1, orderQty)
     }
 
     func estimatedRiskText() -> String {
@@ -5474,18 +5966,18 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     }
 
     func rrText() -> String {
-        guard tpEnabled, slEnabled else { return "--" }
-        let sl = effectiveSLTicks()
-        let tp = effectiveTPTicks()
+        guard protectionDisplayActive(kind: "TP"), protectionDisplayActive(kind: "SL") else { return "--" }
+        let sl = protectionDisplayTicks(kind: "SL")
+        let tp = protectionDisplayTicks(kind: "TP")
         guard sl > 0, tp > 0 else { return "--" }
         let rr = Double(tp) / Double(sl)
         return "\(String(format: "%.2f", rr)) : 1"
     }
 
     func rrCompactText() -> String {
-        guard tpEnabled, slEnabled else { return "--" }
-        let sl = effectiveSLTicks()
-        let tp = effectiveTPTicks()
+        guard protectionDisplayActive(kind: "TP"), protectionDisplayActive(kind: "SL") else { return "--" }
+        let sl = protectionDisplayTicks(kind: "SL")
+        let tp = protectionDisplayTicks(kind: "TP")
         guard sl > 0, tp > 0 else { return "--" }
         return String(format: "%.2f", Double(tp) / Double(sl))
     }
