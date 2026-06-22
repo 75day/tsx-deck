@@ -26,6 +26,7 @@ TICKET_STATE_SRC="$SCRIPT_DIR/PanelController+TicketState.swift"
 WORKING_ORDERS_SRC="$SCRIPT_DIR/PanelController+WorkingOrders.swift"
 REFRESH_SRC="$SCRIPT_DIR/PanelController+Refresh.swift"
 SELECTION_SRC="$SCRIPT_DIR/PanelController+Selection.swift"
+REALTIME_STREAMS_SRC="$SCRIPT_DIR/PanelController+RealtimeStreams.swift"
 MAIN_SRC="$SCRIPT_DIR/main.swift"
 RES_DIR="$SCRIPT_DIR/Resources"
 OUT_APP="$SCRIPT_DIR/$APP_NAME.app"
@@ -43,6 +44,7 @@ echo "Ticket State: $TICKET_STATE_SRC"
 echo "Working Orders: $WORKING_ORDERS_SRC"
 echo "Refresh: $REFRESH_SRC"
 echo "Selection: $SELECTION_SRC"
+echo "Realtime Streams: $REALTIME_STREAMS_SRC"
 echo "Main: $MAIN_SRC"
 echo "Resources: $RES_DIR"
 
@@ -59,14 +61,14 @@ xcrun swiftc -sdk "$(xcrun --show-sdk-path)" \
   -target arm64-apple-macos${MIN_OS} \
   -framework AppKit -framework Foundation \
   -file-prefix-map "$SCRIPT_DIR=." \
-  "$CORE_SRC" "$CONTROLS_SRC" "$VIEWS_SRC" "$SRC" "$LAYOUT_SRC" "$TEXT_SRC" "$TICKET_UI_SRC" "$TICKET_STATE_SRC" "$WORKING_ORDERS_SRC" "$REFRESH_SRC" "$SELECTION_SRC" "$MAIN_SRC" -o "$ARM64_BIN"
+  "$CORE_SRC" "$CONTROLS_SRC" "$VIEWS_SRC" "$SRC" "$LAYOUT_SRC" "$TEXT_SRC" "$TICKET_UI_SRC" "$TICKET_STATE_SRC" "$WORKING_ORDERS_SRC" "$REFRESH_SRC" "$SELECTION_SRC" "$REALTIME_STREAMS_SRC" "$MAIN_SRC" -o "$ARM64_BIN"
 
 echo "→ Building x86_64..."
 xcrun swiftc -sdk "$(xcrun --show-sdk-path)" \
   -target x86_64-apple-macos${MIN_OS} \
   -framework AppKit -framework Foundation \
   -file-prefix-map "$SCRIPT_DIR=." \
-  "$CORE_SRC" "$CONTROLS_SRC" "$VIEWS_SRC" "$SRC" "$LAYOUT_SRC" "$TEXT_SRC" "$TICKET_UI_SRC" "$TICKET_STATE_SRC" "$WORKING_ORDERS_SRC" "$REFRESH_SRC" "$SELECTION_SRC" "$MAIN_SRC" -o "$X86_BIN"
+  "$CORE_SRC" "$CONTROLS_SRC" "$VIEWS_SRC" "$SRC" "$LAYOUT_SRC" "$TEXT_SRC" "$TICKET_UI_SRC" "$TICKET_STATE_SRC" "$WORKING_ORDERS_SRC" "$REFRESH_SRC" "$SELECTION_SRC" "$REALTIME_STREAMS_SRC" "$MAIN_SRC" -o "$X86_BIN"
 
 echo "→ Creating universal binary..."
 lipo -create "$ARM64_BIN" "$X86_BIN" -output "$OUT_APP/Contents/MacOS/$EXECUTABLE_NAME"
