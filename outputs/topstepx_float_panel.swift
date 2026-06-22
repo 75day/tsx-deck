@@ -10,7 +10,7 @@ import Foundation
 //   1. Read SESSION_SUMMARY.md (same directory) first — it contains
 //      architecture notes, what was fixed, current status, build/deploy
 //      instructions, and tips.
-//   2. The entire application is deliberately in this single .swift file.
+//   2. The app is now split into a small core file, this panel/UI file, and main.swift.
 //   3. "一切正常" (everything working) as of the end of the last session.
 //   4. Key recent areas: realtime fidelity, cross-symbol isolation,
 //      custom toasts + sounds (TP.caf / Order.caf), hover/press feedback
@@ -20,1424 +20,24 @@ import Foundation
 // File last meaningfully updated: June 2026 (hover feedback final polish)
 // ============================================================================
 
-struct Contract {
-    let price: Double
-    let tick: Double
-    let tickValue: Double
-    let id: String
-}
-
-struct APIConfig: Decodable {
-    let baseURL: String
-    let userName: String
-    let apiKey: String
-    let readOnly: Bool
-    let leadAccountId: Int?
-    let followerAccountIds: [Int]?
-    let practiceAccountIds: [Int]?
-    let manualRisk: ManualRisk?
-    let accountSize: String?
-    let localDailyMaxLoss: Double?
-    let localDailyProfitTarget: Double?
-    let sendBrackets: Bool?
-}
-
-struct ManualRisk: Decodable {
-    let mll: Double?
-    let dllUsed: Double?
-    let dllLimit: Double?
-    let pdptUsed: Double?
-    let pdptLimit: Double?
-    let source: String?
-}
-
-struct AccountInfo {
-    let id: Int
-    let name: String
-    let balance: Double?
-    let canTrade: Bool?
-    let simulated: Bool?
-    let isVisible: Bool?
-
-    var menuTitle: String {
-        let compact = name.replacingOccurrences(of: "-219616-", with: "-")
-        return compact.count > 22 ? String(compact.prefix(22)) + "..." : compact
-    }
-
-}
-
-struct ReadOnlySnapshot {
-    let accountId: Int?
-    let accountName: String
-    let balance: Double?
-    let canTrade: Bool?
-    let realizedDayPnl: Double?
-    let unrealizedPnl: Double?
-    let openOrderCount: Int
-    let openPositionCount: Int
-    let tradeCount: Int
-    let contractId: String?
-    let rawAccountKeys: [String]
-    let accounts: [AccountInfo]
-    let openOrders: [[String: Any]]
-    let openPositions: [[String: Any]]
-    let trades: [[String: Any]]
-}
-
-final class ProjectXClient {
-    let config: APIConfig
-    var token: String?
-    var tokenIssuedAt: Date?
-
-    init(config: APIConfig) {
-        self.config = config
-    }
-
-    static func loadConfig() -> APIConfig? {
-        let bundledConfig = Bundle.main.resourceURL?.appendingPathComponent("topstepx_config.json")
-        let appSupportFromHome = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library")
-            .appendingPathComponent("Application Support")
-            .appendingPathComponent("TopstepXFloatPanel")
-            .appendingPathComponent("topstepx_config.json")
-        let appSupportFromFileManager = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library")
-            .appendingPathComponent("Application Support")
-            .appendingPathComponent("TopstepXFloatPanel")
-            .appendingPathComponent("topstepx_config.json")
-        for url in [bundledConfig, appSupportFromHome, appSupportFromFileManager].compactMap({ $0 }) {
-            if let data = try? Data(contentsOf: url),
-               let config = try? JSONDecoder().decode(APIConfig.self, from: data),
-               !config.userName.contains("YOUR_"),
-               !config.apiKey.contains("YOUR_") {
-                return config
-            }
-        }
-        return nil
-    }
-
-    func refresh(symbol: String, accountId: Int?, completion: @escaping (Result<ReadOnlySnapshot, Error>) -> Void) {
-        login { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success:
-                self.fetchSnapshot(symbol: symbol, selectedAccountId: accountId, completion: completion)
-            }
-        }
-    }
-
-    func ensureToken(completion: @escaping (Result<String, Error>) -> Void) {
-        login { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success:
-                if let token = self.token {
-                    completion(.success(token))
-                } else {
-                    completion(.failure(ProjectXError.api("token missing")))
-                }
-            }
-        }
-    }
-
-    private func login(completion: @escaping (Result<Void, Error>) -> Void) {
-        if token != nil {
-            completion(.success(()))
-            return
-        }
-        post(path: "/api/Auth/loginKey", body: ["userName": config.userName, "apiKey": config.apiKey], authenticated: false) { result in
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success(let json):
-                guard let success = json["success"] as? Bool, success,
-                      let token = json["token"] as? String else {
-                    completion(.failure(ProjectXError.api(json["errorMessage"] as? String ?? "loginKey failed")))
-                    return
-                }
-                self.token = token
-                self.tokenIssuedAt = Date()
-                completion(.success(()))
-            }
-        }
-    }
-
-    func validateToken(completion: @escaping (Result<String, Error>) -> Void) {
-        login { [weak self] loginResult in
-            guard let self else { return }
-            switch loginResult {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success:
-                self.post(path: "/api/Auth/validate", body: [:], authenticated: true) { result in
-                    switch result {
-                    case .failure(let error):
-                        self.token = nil
-                        completion(.failure(error))
-                    case .success(let json):
-                        guard let success = json["success"] as? Bool, success else {
-                            self.token = nil
-                            completion(.failure(ProjectXError.api(json["errorMessage"] as? String ?? "validate failed")))
-                            return
-                        }
-                        if let newToken = json["newToken"] as? String, !newToken.isEmpty {
-                            self.token = newToken
-                            self.tokenIssuedAt = Date()
-                            completion(.success("Token Refreshed"))
-                        } else {
-                            completion(.success("Token Valid"))
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    func placeOrder(payload: [String: Any], completion: @escaping (Result<Int, Error>) -> Void) {
-        login { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success:
-                self.post(path: "/api/Order/place", body: payload, authenticated: true) { result in
-                    switch result {
-                    case .failure(let error):
-                        completion(.failure(error))
-                    case .success(let json):
-                        guard self.apiSuccess(json) else {
-                            completion(.failure(ProjectXError.api(self.apiErrorMessage(json, fallback: "order place failed"))))
-                            return
-                        }
-                        let orderId = json["orderId"] as? Int ?? (json["orderId"] as? NSNumber)?.intValue ?? 0
-                        completion(.success(orderId))
-                    }
-                }
-            }
-        }
-    }
-
-    func cancelOrder(accountId: Int, orderId: Int, completion: @escaping (Result<Void, Error>) -> Void) {
-        login { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success:
-                self.post(path: "/api/Order/cancel", body: ["accountId": accountId, "orderId": orderId], authenticated: true) { result in
-                    switch result {
-                    case .failure(let error):
-                        completion(.failure(error))
-                    case .success(let json):
-                        guard self.apiSuccess(json) else {
-                            completion(.failure(ProjectXError.api(self.apiErrorMessage(json, fallback: "order cancel failed"))))
-                            return
-                        }
-                        completion(.success(()))
-                    }
-                }
-            }
-        }
-    }
-
-    func modifyOrder(payload: [String: Any], completion: @escaping (Result<Void, Error>) -> Void) {
-        login { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success:
-                self.post(path: "/api/Order/modify", body: payload, authenticated: true) { result in
-                    switch result {
-                    case .failure(let error):
-                        completion(.failure(error))
-                    case .success(let json):
-                        guard self.apiSuccess(json) else {
-                            completion(.failure(ProjectXError.api(self.apiErrorMessage(json, fallback: "order modify failed"))))
-                            return
-                        }
-                        completion(.success(()))
-                    }
-                }
-            }
-        }
-    }
-
-    func closeContract(accountId: Int, contractId: String, completion: @escaping (Result<Void, Error>) -> Void) {
-        login { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success:
-                self.post(path: "/api/Position/closeContract", body: ["accountId": accountId, "contractId": contractId], authenticated: true) { result in
-                    switch result {
-                    case .failure(let error):
-                        completion(.failure(error))
-                    case .success(let json):
-                        guard self.apiSuccess(json) else {
-                            completion(.failure(ProjectXError.api(self.apiErrorMessage(json, fallback: "position close failed"))))
-                            return
-                        }
-                        completion(.success(()))
-                    }
-                }
-            }
-        }
-    }
-
-    private func apiSuccess(_ json: [String: Any]) -> Bool {
-        return json["success"] as? Bool ?? false
-    }
-
-    private func apiErrorMessage(_ json: [String: Any], fallback: String) -> String {
-        return json["errorMessage"] as? String ?? fallback
-    }
-
-    private func fetchSnapshot(symbol: String, selectedAccountId: Int?, completion: @escaping (Result<ReadOnlySnapshot, Error>) -> Void) {
-        post(path: "/api/Account/search", body: ["onlyActiveAccounts": true], authenticated: true) { result in
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success(let accountJson):
-                let rawAccounts = accountJson["accounts"] as? [[String: Any]] ?? []
-                let accounts = rawAccounts.compactMap(self.parseAccount).sorted {
-                    self.sortRank($0.id) < self.sortRank($1.id)
-                }
-                let account = self.pickAccount(rawAccounts, selectedAccountId: selectedAccountId, sortedAccounts: accounts)
-                let accountId = self.intValue(account?["id"])
-                let name = account?["name"] as? String ?? "No account"
-                let balance = account?["balance"] as? Double ?? (account?["balance"] as? NSNumber)?.doubleValue
-                let canTrade = account?["canTrade"] as? Bool
-                let realizedDayPnl = self.numberValue(account?["realizedDayPnl"])
-                let unrealizedPnl = self.numberValue(account?["unrealizedPnl"])
-                let keys = account.map { Array($0.keys).sorted() } ?? []
-                guard let accountId else {
-                    completion(.success(ReadOnlySnapshot(accountId: nil, accountName: name, balance: balance, canTrade: canTrade, realizedDayPnl: realizedDayPnl, unrealizedPnl: unrealizedPnl, openOrderCount: 0, openPositionCount: 0, tradeCount: 0, contractId: nil, rawAccountKeys: keys, accounts: accounts, openOrders: [], openPositions: [], trades: [])))
-                    return
-                }
-                self.fetchDetails(accountId: accountId, symbol: symbol) { details in
-                    completion(.success(ReadOnlySnapshot(
-                        accountId: accountId,
-                        accountName: name,
-                        balance: balance,
-                        canTrade: canTrade,
-                        realizedDayPnl: realizedDayPnl,
-                        unrealizedPnl: unrealizedPnl,
-                        openOrderCount: details.orders,
-                        openPositionCount: details.positions,
-                        tradeCount: details.trades,
-                        contractId: details.contractId,
-                        rawAccountKeys: keys,
-                        accounts: accounts,
-                        openOrders: details.openOrders,
-                        openPositions: details.openPositions,
-                        trades: details.tradesList
-                    )))
-                }
-            }
-        }
-    }
-
-    private func numberValue(_ value: Any?) -> Double? {
-        if let value = value as? Double { return value }
-        if let value = value as? NSNumber { return value.doubleValue }
-        if let value = value as? String { return Double(value) }
-        return nil
-    }
-
-    private func intValue(_ value: Any?) -> Int? {
-        if let value = value as? Int { return value }
-        if let value = value as? NSNumber { return value.intValue }
-        if let value = value as? String { return Int(value) }
-        return nil
-    }
-
-    private func parseAccount(_ account: [String: Any]) -> AccountInfo? {
-        guard let id = intValue(account["id"]),
-              let name = account["name"] as? String else { return nil }
-        let balance = account["balance"] as? Double ?? (account["balance"] as? NSNumber)?.doubleValue
-        return AccountInfo(
-            id: id,
-            name: name,
-            balance: balance,
-            canTrade: account["canTrade"] as? Bool,
-            simulated: account["simulated"] as? Bool,
-            isVisible: account["isVisible"] as? Bool
-        )
-    }
-
-    private func sortRank(_ accountId: Int) -> Int {
-        if config.leadAccountId == accountId { return 0 }
-        if config.followerAccountIds?.contains(accountId) == true { return 1 }
-        if config.practiceAccountIds?.contains(accountId) == true { return 3 }
-        return 2
-    }
-
-    private func pickAccount(_ accounts: [[String: Any]], selectedAccountId: Int?, sortedAccounts: [AccountInfo]) -> [String: Any]? {
-        if let selectedAccountId {
-            return accounts.first { self.intValue($0["id"]) == selectedAccountId } ?? accounts.first
-        }
-        if let lead = config.leadAccountId {
-            if let account = accounts.first(where: { self.intValue($0["id"]) == lead }) {
-                return account
-            }
-        }
-        if let firstSorted = sortedAccounts.first {
-            return accounts.first { self.intValue($0["id"]) == firstSorted.id }
-        }
-        return accounts.first
-    }
-
-    /// Returns ISO8601 (Z) timestamp for the start of the current TopstepX trading day.
-    /// The official platform resets realized day P&L at 18:00 America/New_York (ET / UTC-4 during daylight).
-    /// Using a naive rolling 24h for /Trade/search caused RP&L to include pre-reset "yesterday" trades
-    /// (and never cleanly reset at 18:00). We now align the window so the fallback sum (and tradeCount)
-    /// reflects only the current session.
-    private func dailyTradeStartISO() -> String {
-        let etTZ = TimeZone(identifier: "America/New_York") ?? .current
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = etTZ
-        let now = Date()
-        var comps = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: now)
-        let currentHour = comps.hour ?? 0
-        if currentHour >= 18 {
-            comps.hour = 18
-            comps.minute = 0
-            comps.second = 0
-        } else {
-            if let yesterday = calendar.date(byAdding: .day, value: -1, to: now) {
-                comps = calendar.dateComponents([.year, .month, .day], from: yesterday)
-                comps.hour = 18
-                comps.minute = 0
-                comps.second = 0
-            }
-        }
-        if let etDate = calendar.date(from: comps) {
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            return formatter.string(from: etDate)
-        }
-        // Fallback (should not reach)
-        return ISO8601DateFormatter().string(from: Date().addingTimeInterval(-24 * 60 * 60))
-    }
-
-    private func fetchDetails(accountId: Int, symbol: String, completion: @escaping ((orders: Int, positions: Int, trades: Int, contractId: String?, openOrders: [[String: Any]], openPositions: [[String: Any]], tradesList: [[String: Any]])) -> Void) {
-        let group = DispatchGroup()
-        var orders = 0
-        var positions = 0
-        var trades = 0
-        var contractId: String?
-        var openOrders: [[String: Any]] = []
-        var openPositions: [[String: Any]] = []
-        var tradesList: [[String: Any]] = []
-
-        group.enter()
-        post(path: "/api/Order/searchOpen", body: ["accountId": accountId], authenticated: true) { result in
-            if case .success(let json) = result {
-                openOrders = json["orders"] as? [[String: Any]] ?? []
-                orders = openOrders.count
-            }
-            group.leave()
-        }
-
-        group.enter()
-        post(path: "/api/Position/searchOpen", body: ["accountId": accountId], authenticated: true) { result in
-            if case .success(let json) = result {
-                openPositions = json["positions"] as? [[String: Any]] ?? []
-                positions = openPositions.count
-            }
-            group.leave()
-        }
-
-        group.enter()
-        // Use trading-day aligned window (18:00 ET reset) instead of naive -24h so RP&L
-        // (and trade count) correctly exclude pre-reset trades from "yesterday".
-        let start = dailyTradeStartISO()
-        let end = ISO8601DateFormatter().string(from: Date())
-        post(path: "/api/Trade/search", body: ["accountId": accountId, "startTimestamp": start, "endTimestamp": end], authenticated: true) { result in
-            if case .success(let json) = result {
-                tradesList = json["trades"] as? [[String: Any]] ?? []
-                trades = tradesList.count
-            }
-            group.leave()
-        }
-
-        group.enter()
-        post(path: "/api/Contract/search", body: ["searchText": symbol, "live": false], authenticated: true) { result in
-            if case .success(let json) = result,
-               let contracts = json["contracts"] as? [[String: Any]] {
-                contractId = contracts.first?["id"] as? String
-            }
-            group.leave()
-        }
-
-        group.notify(queue: .main) {
-            completion((orders, positions, trades, contractId, openOrders, openPositions, tradesList))
-        }
-    }
-
-    private func post(path: String, body: [String: Any], authenticated: Bool, completion: @escaping (Result<[String: Any], Error>) -> Void) {
-        guard let url = URL(string: config.baseURL + path) else {
-            completion(.failure(ProjectXError.api("bad URL \(path)")))
-            return
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("text/plain", forHTTPHeaderField: "accept")
-        if authenticated, let token {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [])
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error {
-                DispatchQueue.main.async { completion(.failure(error)) }
-                return
-            }
-            guard let http = response as? HTTPURLResponse, let data else {
-                DispatchQueue.main.async { completion(.failure(ProjectXError.api("empty response"))) }
-                return
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                let message = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
-                DispatchQueue.main.async { completion(.failure(ProjectXError.api(message))) }
-                return
-            }
-            do {
-                let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-                DispatchQueue.main.async { completion(.success(json)) }
-            } catch {
-                DispatchQueue.main.async { completion(.failure(error)) }
-            }
-        }.resume()
-    }
-}
-
-enum ProjectXError: Error, LocalizedError {
-    case api(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .api(let message): return message
-        }
-    }
-}
-
-final class SignalRRealtimeClient {
-    private let separator = "\u{1e}"
-    private var task: URLSessionWebSocketTask?
-    private var accountId: Int?
-    private var contractId: String?
-    private let hub: String
-    private var didHandshake = false
-
-    init(hub: String = "user") {
-        self.hub = hub
-    }
-
-    var onStatus: ((String) -> Void)?
-    var onAccount: (([String: Any]) -> Void)?
-    var onOrder: (([String: Any]) -> Void)?
-    var onPosition: (([String: Any]) -> Void)?
-    var onTrade: (([String: Any]) -> Void)?
-    var onQuote: ((String, [String: Any]) -> Void)?
-    var onEvent: ((String) -> Void)?
-
-    func connect(token: String, accountId: Int) {
-        connect(token: token, accountId: accountId, contractId: nil)
-    }
-
-    func connect(token: String, contractId: String) {
-        connect(token: token, accountId: nil, contractId: contractId)
-    }
-
-    private func connect(token: String, accountId: Int?, contractId: String?) {
-        disconnect()
-        self.accountId = accountId
-        self.contractId = contractId
-        didHandshake = false
-
-        var components = URLComponents(string: "wss://rtc.topstepx.com/hubs/\(hub)")
-        components?.queryItems = [URLQueryItem(name: "access_token", value: token)]
-        guard let url = components?.url else {
-            onStatus?("\(statusName()) URL Error")
-            return
-        }
-
-        onStatus?("\(statusName()) Connecting")
-        let task = URLSession.shared.webSocketTask(with: url)
-        self.task = task
-        task.resume()
-        receiveLoop()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak task] in
-            guard let self,
-                  let task,
-                  self.task === task else { return }
-            self.send(["protocol": "json", "version": 1])
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self, weak task] in
-            guard let self,
-                  let task,
-                  self.task === task,
-                  !self.didHandshake else { return }
-            self.onStatus?("\(self.statusName()) Offline")
-            self.disconnect()
-        }
-    }
-
-    func disconnect() {
-        task?.cancel(with: .goingAway, reason: nil)
-        task = nil
-        didHandshake = false
-    }
-
-    private func subscribe() {
-        if hub == "user" {
-            sendInvocation("SubscribeAccounts", [])
-            if let accountId {
-                sendInvocation("SubscribeOrders", [accountId])
-                sendInvocation("SubscribePositions", [accountId])
-                sendInvocation("SubscribeTrades", [accountId])
-            }
-            onStatus?("Stream Live")
-        } else {
-            if let contractId {
-                sendInvocation("SubscribeContractQuotes", [contractId])
-                sendInvocation("SubscribeContractTrades", [contractId])
-            }
-            onStatus?("Market Live")
-        }
-    }
-
-    private func sendInvocation(_ target: String, _ arguments: [Any]) {
-        send(["type": 1, "target": target, "arguments": arguments])
-    }
-
-    private func send(_ object: [String: Any]) {
-        guard let task,
-              let data = try? JSONSerialization.data(withJSONObject: object, options: []),
-              let text = String(data: data, encoding: .utf8) else { return }
-        task.send(.string(text + separator)) { [weak self] error in
-            if error != nil {
-                self?.onStatus?("\(self?.statusName() ?? "Stream") Offline")
-            }
-        }
-    }
-
-    private func receiveLoop() {
-        task?.receive { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure:
-                self.onStatus?("\(self.statusName()) Offline")
-                // health timer (every 8s in controller) will detect Offline and force reconnect via start*IfNeeded
-
-            case .success(let message):
-                switch message {
-                case .string(let text):
-                    self.handle(text)
-                case .data(let data):
-                    if let text = String(data: data, encoding: .utf8) {
-                        self.handle(text)
-                    }
-                @unknown default:
-                    break
-                }
-                self.receiveLoop()
-            }
-        }
-    }
-
-    private func statusName() -> String {
-        return hub == "market" ? "Market" : "Stream"
-    }
-
-    private func handle(_ text: String) {
-        for raw in text.components(separatedBy: separator) where !raw.isEmpty {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed == "{}" {
-                didHandshake = true
-                subscribe()
-                continue
-            }
-            guard let data = trimmed.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-            if json.isEmpty {
-                didHandshake = true
-                subscribe()
-                continue
-            }
-            if let error = json["error"] as? String, !error.isEmpty {
-                onStatus?("\(statusName()) Offline")
-                continue
-            }
-            if (json["type"] as? Int) == 6 {
-                continue
-            }
-            if (json["type"] as? Int) == 7 {
-                onStatus?("\(statusName()) Offline")
-                continue
-            }
-            guard (json["type"] as? Int) == 1,
-                  let target = json["target"] as? String else { continue }
-            onEvent?(target)
-            if target == "GatewayUserAccount" {
-                firstPayloads(json).forEach { onAccount?($0) }
-            } else if target == "GatewayUserOrder" {
-                firstPayloads(json).forEach { onOrder?($0) }
-            } else if target == "GatewayUserPosition" {
-                firstPayloads(json).forEach { onPosition?($0) }
-            } else if target == "GatewayUserTrade" {
-                firstPayloads(json).forEach { onTrade?($0) }
-            } else if target == "GatewayQuote" {
-                guard let payload = firstPayloads(json).first else { continue }
-                let contract = (json["arguments"] as? [Any])?.first as? String ?? contractId ?? ""
-                onQuote?(contract, payload)
-            }
-        }
-    }
-
-    private func firstPayloads(_ json: [String: Any]) -> [[String: Any]] {
-        guard let args = json["arguments"] as? [Any] else { return [] }
-        var payloads: [[String: Any]] = []
-        for arg in args {
-            if let payload = arg as? [String: Any] {
-                payloads.append(payload)
-            }
-            if let list = arg as? [[String: Any]] {
-                payloads.append(contentsOf: list)
-            }
-        }
-        return payloads
-    }
-}
-
-// Supported symbols for the selector. This list is curated (not dynamically fetched from a "list all" endpoint)
-// because we need local knowledge of tick size / tick value for correct price stepping, bracket calcs,
-// mark-to-market PnL, etc. Once selected, the *specific* contract ID (e.g. front month) *is* resolved
-// live from /api/Contract/search, and all quotes/positions come 100% from official TopstepX REST + rtc WS.
-let contracts: [String: Contract] = [
-    "NQ": Contract(price: 18452.25, tick: 0.25, tickValue: 5.00, id: "CON.F.US.ENQ.U25"),
-    "MNQ": Contract(price: 18452.25, tick: 0.25, tickValue: 0.50, id: "CON.F.US.MNQ.U25"),
-    "ES": Contract(price: 5928.25, tick: 0.25, tickValue: 12.50, id: "CON.F.US.EP.U25"),
-    "MES": Contract(price: 5928.25, tick: 0.25, tickValue: 1.25, id: "CON.F.US.MES.U25"),
-    "GC": Contract(price: 3372.8, tick: 0.1, tickValue: 10.00, id: "CON.F.US.GC.Q25"),
-    "MGC": Contract(price: 3372.8, tick: 0.1, tickValue: 1.00, id: "CON.F.US.MGC.Q25")
-]
-
-private let supportedSymbols: [String] = ["NQ", "ES", "MNQ", "MES", "GC", "MGC"]  // curated order, not from API list-all
-
-struct Palette {
-    let bg: NSColor
-    let surface: NSColor
-    let surface2: NSColor
-    let border: NSColor
-    let text: NSColor
-    let muted: NSColor
-    let green: NSColor
-    let red: NSColor
-    let orange: NSColor
-    let blue: NSColor
-}
-
-let darkPalette = Palette(
-    bg: NSColor(calibratedRed: 0.05, green: 0.07, blue: 0.09, alpha: 1),
-    surface: NSColor(calibratedRed: 0.07, green: 0.10, blue: 0.13, alpha: 1),
-    surface2: NSColor(calibratedRed: 0.09, green: 0.13, blue: 0.17, alpha: 1),
-    border: NSColor(calibratedRed: 0.19, green: 0.23, blue: 0.29, alpha: 1),
-    text: NSColor(calibratedRed: 0.90, green: 0.94, blue: 0.97, alpha: 1),
-    muted: NSColor(calibratedRed: 0.54, green: 0.58, blue: 0.64, alpha: 1),
-    green: NSColor(calibratedRed: 0.13, green: 0.77, blue: 0.37, alpha: 1),
-    red: NSColor(calibratedRed: 0.94, green: 0.27, blue: 0.27, alpha: 1),
-    orange: NSColor(calibratedRed: 0.96, green: 0.58, blue: 0.04, alpha: 1),
-    blue: NSColor(calibratedRed: 0.23, green: 0.51, blue: 0.96, alpha: 1)
-)
-
-let lightPalette = Palette(
-    bg: NSColor(calibratedRed: 0.91, green: 0.94, blue: 0.97, alpha: 1),
-    surface: NSColor(calibratedRed: 0.97, green: 0.985, blue: 1.00, alpha: 1),
-    surface2: NSColor(calibratedRed: 0.88, green: 0.92, blue: 0.96, alpha: 1),
-    border: NSColor(calibratedRed: 0.70, green: 0.77, blue: 0.84, alpha: 1),
-    text: NSColor(calibratedRed: 0.04, green: 0.08, blue: 0.13, alpha: 1),
-    muted: NSColor(calibratedRed: 0.39, green: 0.47, blue: 0.58, alpha: 1),
-    green: NSColor(calibratedRed: 0.02, green: 0.58, blue: 0.28, alpha: 1),
-    red: NSColor(calibratedRed: 0.86, green: 0.12, blue: 0.12, alpha: 1),
-    orange: NSColor(calibratedRed: 0.86, green: 0.43, blue: 0.02, alpha: 1),
-    blue: NSColor(calibratedRed: 0.12, green: 0.36, blue: 0.68, alpha: 1)
-)
-
-func money(_ value: Double) -> String {
-    let sign = value >= 0 ? "" : "-"
-    return "\(sign)$\(String(format: "%.2f", abs(value)))"
-}
-
-func number2(_ value: Double) -> String {
-    let formatter = NumberFormatter()
-    formatter.numberStyle = .decimal
-    formatter.minimumFractionDigits = 2
-    formatter.maximumFractionDigits = 2
-    return formatter.string(from: NSNumber(value: value)) ?? String(format: "%.2f", value)
-}
-
-extension NSView {
-    func fixedHeight(_ value: CGFloat) {
-        heightAnchor.constraint(equalToConstant: value).isActive = true
-    }
-
-    func fixedWidth(_ value: CGFloat) {
-        widthAnchor.constraint(equalToConstant: value).isActive = true
-    }
-}
-
-final class TrackingScrollView: NSScrollView {
-    var onScroll: ((CGFloat) -> Void)?
-
-    override func reflectScrolledClipView(_ clipView: NSClipView) {
-        super.reflectScrolledClipView(clipView)
-        onScroll?(clipView.bounds.origin.y)
-    }
-}
-
-final class FillBar: NSView {
-    var palette = darkPalette {
-        didSet { needsDisplay = true }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        let track = NSBezierPath(roundedRect: bounds, xRadius: 3, yRadius: 3)
-        palette.surface2.setFill()
-        track.fill()
-
-        let fill = NSRect(x: 0, y: 0, width: bounds.width * 0.7438, height: bounds.height)
-        let gradient = NSGradient(colors: [palette.green, NSColor.systemYellow, palette.red])
-        gradient?.draw(in: NSBezierPath(roundedRect: fill, xRadius: 3, yRadius: 3), angle: 0)
-
-        let markerX = bounds.width * 0.75
-        let marker = NSBezierPath()
-        marker.move(to: NSPoint(x: markerX - 5, y: bounds.height + 6))
-        marker.line(to: NSPoint(x: markerX + 5, y: bounds.height + 6))
-        marker.line(to: NSPoint(x: markerX, y: bounds.height))
-        marker.close()
-        palette.text.setFill()
-        marker.fill()
-    }
-}
-
-final class PillButton: NSButton {
-    var bgColor = NSColor.clear
-    var fgColor = NSColor.white
-    var visualFeedback = true
-
-    private var trackingArea: NSTrackingArea?
-    private var hovered = false
-    private var pressed = false
-    private var baseBorderWidth: CGFloat = 0
-    private var baseBorderColor: CGColor?
-    private var hoverable = true
-
-    convenience init(_ title: String, bg: NSColor, fg: NSColor, size: CGFloat = 12, hoverable: Bool = true) {
-        self.init(frame: .zero)
-        self.title = title
-        self.bgColor = bg
-        self.fgColor = fg
-        self.font = NSFont.systemFont(ofSize: size, weight: .bold)
-        self.isBordered = false
-        self.wantsLayer = true
-        self.layer?.cornerRadius = 6
-        self.layer?.backgroundColor = bg.cgColor
-        self.contentTintColor = fg
-        self.setButtonType(.momentaryPushIn)
-        self.hoverable = hoverable
-        if hoverable {
-            setupTracking()
-        }
-        updateAppearance(animated: false)
-        captureBaseBorder()
-    }
-
-    private func setupTracking() {
-        if let ta = trackingArea {
-            removeTrackingArea(ta)
-        }
-        trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea!)
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if hoverable {
-            setupTracking()
-        }
-    }
-
-    override func resetCursorRects() {
-        super.resetCursorRects()
-        if isEnabled && hoverable {
-            addCursorRect(bounds, cursor: .pointingHand)
-        }
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        super.mouseEntered(with: event)
-        if hoverable && isEnabled {
-            hovered = true
-            updateAppearance(animated: true)
-        }
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        super.mouseExited(with: event)
-        hovered = false
-        pressed = false
-        updateAppearance(animated: false)  // snap restore immediately to avoid lingering highlight
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        if hoverable && isEnabled {
-            pressed = true
-            updateAppearance(animated: false)
-        }
-        super.mouseDown(with: event)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        if hoverable && isEnabled {
-            pressed = false
-            updateAppearance(animated: true)
-        }
-        super.mouseUp(with: event)
-    }
-
-    private func updateAppearance(animated: Bool) {
-        guard let layer = self.layer else { return }
-
-        // Always clear any pending hover animations first to prevent lingering effects (especially slow fade on exit)
-        layer.removeAllAnimations()
-
-        var targetBg = bgColor
-        var targetTint = fgColor
-
-        let lowAlpha = bgColor.alphaComponent < 0.15
-
-        if !visualFeedback {
-            targetBg = bgColor
-            targetTint = isEnabled ? fgColor : fgColor.withAlphaComponent(0.42)
-        } else if !isEnabled {
-            targetBg = bgColor.withAlphaComponent(0.32)
-            targetTint = fgColor.withAlphaComponent(0.42)
-        } else if pressed {
-            targetBg = bgColor.blended(withFraction: 0.38, of: NSColor.black) ?? bgColor
-            targetTint = fgColor.withAlphaComponent(0.82)
-        } else if hovered {
-            if lowAlpha {
-                targetBg = bgColor
-                targetTint = fgColor.withAlphaComponent(0.85)
-            } else {
-                targetBg = bgColor.blended(withFraction: 0.22, of: NSColor.white) ?? bgColor
-                targetTint = fgColor
-            }
-        }
-
-        let duration: TimeInterval = pressed ? 0.035 : 0.085
-
-        if animated {
-            let bgAnim = CABasicAnimation(keyPath: "backgroundColor")
-            bgAnim.fromValue = layer.backgroundColor
-            bgAnim.toValue = targetBg.cgColor
-            bgAnim.duration = duration
-            bgAnim.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            layer.add(bgAnim, forKey: "bgHover")
-
-            let s: CGFloat = pressed ? 0.965 : 1.0
-            let t = CATransform3DMakeScale(s, s, 1.0)
-            let scaleAnim = CABasicAnimation(keyPath: "transform")
-            scaleAnim.fromValue = layer.transform
-            scaleAnim.toValue = t
-            scaleAnim.duration = duration
-            scaleAnim.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            layer.add(scaleAnim, forKey: "scaleHover")
-
-            layer.backgroundColor = targetBg.cgColor
-            layer.transform = t
-        } else {
-            // Force immediate, no animation at all on exit (especially important for low-alpha buttons)
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer.backgroundColor = targetBg.cgColor
-            layer.transform = CATransform3DMakeScale(1.0, 1.0, 1.0)
-            CATransaction.commit()
-        }
-
-        // Tint change also forced immediate when not animating
-        if !animated {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            self.contentTintColor = targetTint
-            CATransaction.commit()
-        } else {
-            self.contentTintColor = targetTint
-        }
-
-        if visualFeedback && hovered && !lowAlpha {
-            layer.borderWidth = 1
-            layer.borderColor = fgColor.withAlphaComponent(0.3).cgColor
-        } else if !hovered {
-            layer.borderWidth = baseBorderWidth
-            layer.borderColor = baseBorderColor
-        }
-    }
-
-    func captureBaseBorder() {
-        if let l = layer {
-            baseBorderWidth = l.borderWidth
-            baseBorderColor = l.borderColor
-        }
-    }
-}
-
-final class HoverPopUpButton: NSPopUpButton {
-    var normalBackgroundColor = NSColor.clear
-    var hoverBackgroundColor = NSColor.clear
-    var normalBorderColor = NSColor.clear
-    var hoverBorderColor = NSColor.clear
-
-    private var trackingArea: NSTrackingArea?
-    private var hovered = false
-
-    init() {
-        super.init(frame: .zero, pullsDown: false)
-        setupTracking()
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    func configureHover(normalBg: NSColor, hoverBg: NSColor, normalBorder: NSColor, hoverBorder: NSColor) {
-        normalBackgroundColor = normalBg
-        hoverBackgroundColor = hoverBg
-        normalBorderColor = normalBorder
-        hoverBorderColor = hoverBorder
-        applyHoverState(animated: false)
-    }
-
-    private func setupTracking() {
-        if let trackingArea {
-            removeTrackingArea(trackingArea)
-        }
-        trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea!)
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        setupTracking()
-    }
-
-    override func resetCursorRects() {
-        super.resetCursorRects()
-        if isEnabled {
-            addCursorRect(bounds, cursor: .pointingHand)
-        }
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        super.mouseEntered(with: event)
-        hovered = true
-        applyHoverState(animated: true)
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        super.mouseExited(with: event)
-        hovered = false
-        applyHoverState(animated: true)
-    }
-
-    private func applyHoverState(animated: Bool) {
-        guard let layer else { return }
-        layer.removeAllAnimations()
-        let bg = hovered ? hoverBackgroundColor : normalBackgroundColor
-        let border = hovered ? hoverBorderColor : normalBorderColor
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(!animated)
-        CATransaction.setAnimationDuration(0.09)
-        layer.backgroundColor = bg.cgColor
-        layer.borderColor = border.cgColor
-        CATransaction.commit()
-    }
-}
-
-final class HoverProxyButton: NSButton {
-    var onHoverChanged: ((Bool) -> Void)?
-    private var trackingArea: NSTrackingArea?
-
-    init() {
-        super.init(frame: .zero)
-        title = ""
-        isBordered = false
-        setButtonType(.momentaryPushIn)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-        setupTracking()
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    private func setupTracking() {
-        if let trackingArea {
-            removeTrackingArea(trackingArea)
-        }
-        trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea!)
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        setupTracking()
-    }
-
-    override func resetCursorRects() {
-        super.resetCursorRects()
-        if isEnabled {
-            addCursorRect(bounds, cursor: .pointingHand)
-        }
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        super.mouseEntered(with: event)
-        if isEnabled {
-            onHoverChanged?(true)
-        }
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        super.mouseExited(with: event)
-        onHoverChanged?(false)
-    }
-}
-
-final class SpreadBadge: NSTextField {
-    private final class CenteredTextCell: NSTextFieldCell {
-        override func drawingRect(forBounds rect: NSRect) -> NSRect {
-            var drawingRect = super.drawingRect(forBounds: rect)
-            let textSize = cellSize(forBounds: rect)
-            drawingRect.origin.y += max(0, (rect.height - textSize.height) / 2) - 1
-            drawingRect.size.height = textSize.height
-            return drawingRect
-        }
-    }
-
-    init(_ value: String, bg: NSColor, fg: NSColor, border: NSColor) {
-        super.init(frame: .zero)
-        cell = CenteredTextCell(textCell: value)
-        stringValue = value
-        isEditable = false
-        isSelectable = false
-        isBordered = false
-        drawsBackground = false
-        alignment = .center
-        font = NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .semibold)
-        textColor = fg
-        lineBreakMode = .byClipping
-        wantsLayer = true
-        layer?.cornerRadius = 6
-        layer?.backgroundColor = bg.cgColor
-        layer?.borderWidth = 1
-        layer?.borderColor = border.cgColor
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-}
-
-final class QuoteButton: NSButton {
-    private let sideLabel = NSTextField(labelWithString: "")
-    private let priceLabel = NSTextField(labelWithString: "")
-    private var quoteSide = "BUY"
-    private var quoteColor = NSColor.white
-    private let horizontalInset: CGFloat = 12
-
-    private var baseBgColor = NSColor.clear
-    private var trackingArea: NSTrackingArea?
-    private var hovered = false
-    private var pressed = false
-
-    convenience init(side: String, price: String, bg: NSColor, fg: NSColor) {
-        self.init(frame: .zero)
-        title = ""
-        quoteSide = side
-        quoteColor = fg
-        isBordered = false
-        imagePosition = .noImage
-        wantsLayer = true
-        layer?.cornerRadius = 8
-        layer?.backgroundColor = bg.cgColor
-        baseBgColor = bg
-        setButtonType(.momentaryPushIn)
-        setupLabels()
-        setupTracking()
-        updateAppearance(animated: false)
-        update(side: side, price: price, color: fg)
-    }
-
-    private func setupLabels() {
-        [sideLabel, priceLabel].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            $0.isSelectable = false
-            $0.lineBreakMode = .byTruncatingTail
-            addSubview($0)
-        }
-        sideLabel.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        priceLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold)
-        NSLayoutConstraint.activate([
-            sideLabel.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-            priceLabel.topAnchor.constraint(equalTo: sideLabel.bottomAnchor, constant: 2),
-            priceLabel.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -6)
-        ])
-    }
-
-    func update(side: String, price: String, color: NSColor) {
-        quoteSide = side
-        quoteColor = color
-        sideLabel.stringValue = side
-        priceLabel.stringValue = price
-        sideLabel.textColor = color
-        priceLabel.textColor = color
-        sideLabel.alignment = side == "BUY" ? .right : .left
-        priceLabel.alignment = side == "BUY" ? .right : .left
-        removeQuoteAlignmentConstraints()
-        if side == "BUY" {
-            sideLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -horizontalInset).isActive = true
-            sideLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: horizontalInset).isActive = true
-            priceLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -horizontalInset).isActive = true
-            priceLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: horizontalInset).isActive = true
-        } else {
-            sideLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: horizontalInset).isActive = true
-            sideLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -horizontalInset).isActive = true
-            priceLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: horizontalInset).isActive = true
-            priceLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -horizontalInset).isActive = true
-        }
-    }
-
-    private func removeQuoteAlignmentConstraints() {
-        for constraint in constraints {
-            let first = constraint.firstItem as AnyObject?
-            let second = constraint.secondItem as AnyObject?
-            let isHorizontal = constraint.firstAttribute == .leading || constraint.firstAttribute == .trailing
-                || constraint.secondAttribute == .leading || constraint.secondAttribute == .trailing
-            if isHorizontal && (first === sideLabel || second === sideLabel || first === priceLabel || second === priceLabel) {
-                constraint.isActive = false
-            }
-        }
-    }
-
-    private func setupTracking() {
-        if let ta = trackingArea {
-            removeTrackingArea(ta)
-        }
-        trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea!)
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        setupTracking()
-    }
-
-    override func resetCursorRects() {
-        super.resetCursorRects()
-        if isEnabled {
-            addCursorRect(bounds, cursor: .pointingHand)
-        }
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        super.mouseEntered(with: event)
-        if isEnabled {
-            hovered = true
-            updateAppearance(animated: true)
-        }
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        super.mouseExited(with: event)
-        hovered = false
-        pressed = false
-        updateAppearance(animated: false)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        if isEnabled {
-            pressed = true
-            updateAppearance(animated: false)
-        }
-        super.mouseDown(with: event)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        if isEnabled {
-            pressed = false
-            updateAppearance(animated: true)
-        }
-        super.mouseUp(with: event)
-    }
-
-    private func updateAppearance(animated: Bool) {
-        guard let layer = self.layer else { return }
-
-        var target = baseBgColor
-
-        if !isEnabled {
-            target = baseBgColor.withAlphaComponent(0.38)
-        } else if pressed {
-            target = baseBgColor.blended(withFraction: 0.35, of: NSColor.black) ?? baseBgColor
-        } else if hovered {
-            // strong hover lift so the big quote buttons feel very alive
-            target = baseBgColor.blended(withFraction: 0.22, of: NSColor.white) ?? baseBgColor
-        }
-
-        let duration: TimeInterval = pressed ? 0.03 : 0.09
-
-        if animated {
-            let bgAnim = CABasicAnimation(keyPath: "backgroundColor")
-            bgAnim.fromValue = layer.backgroundColor
-            bgAnim.toValue = target.cgColor
-            bgAnim.duration = duration
-            bgAnim.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            layer.add(bgAnim, forKey: "bgHover")
-
-            let s: CGFloat = pressed ? 0.97 : 1.0
-            let t = CATransform3DMakeScale(s, s, 1.0)
-            let scaleAnim = CABasicAnimation(keyPath: "transform")
-            scaleAnim.fromValue = layer.transform
-            scaleAnim.toValue = t
-            scaleAnim.duration = duration
-            scaleAnim.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            layer.add(scaleAnim, forKey: "scaleHover")
-
-            layer.backgroundColor = target.cgColor
-            layer.transform = t
-        } else {
-            layer.backgroundColor = target.cgColor
-            let s: CGFloat = pressed ? 0.97 : 1.0
-            layer.transform = CATransform3DMakeScale(s, s, 1.0)
-        }
-    }
-}
-
-final class CenteredTextFieldCell: NSTextFieldCell {
-    override func drawingRect(forBounds rect: NSRect) -> NSRect {
-        var drawingRect = super.drawingRect(forBounds: rect)
-        let textSize = cellSize(forBounds: rect)
-        drawingRect.origin.y = rect.origin.y + max(0, (rect.height - textSize.height) / 2) - 1
-        return drawingRect
-    }
-
-    override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
-        super.edit(withFrame: drawingRect(forBounds: rect), in: controlView, editor: textObj, delegate: delegate, event: event)
-    }
-
-    override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
-        super.select(withFrame: drawingRect(forBounds: rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
-    }
-}
-
-func extractNumber(_ text: String) -> Double? {
-    let normalized = text
-        .replacingOccurrences(of: "−", with: "-")
-        .replacingOccurrences(of: "–", with: "-")
-    let pattern = "-?(?:\\d{1,3}(?:,\\d{3})+|\\d+)(?:\\.\\d+)?"
-    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
-    let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
-    let matches = regex.matches(in: normalized, range: range)
-    guard let match = matches.last,
-          let swiftRange = Range(match.range, in: normalized) else { return nil }
-    let cleaned = normalized[swiftRange].replacingOccurrences(of: ",", with: "")
-    return Double(cleaned)
-}
-
-final class PriceInputTextField: NSTextField {
-    var onBegin: ((NSTextField) -> Void)?
-    var onCommit: ((NSTextField) -> Void)?
-    private var pendingPasteCommit = false
-
-    @objc func paste(_ sender: Any?) {
-        guard let raw = NSPasteboard.general.string(forType: .string),
-              let value = extractNumber(raw) else {
-            currentEditor()?.paste(sender)
-            return
-        }
-        let pasted = String(format: "%.2f", value)
-        if let editor = currentEditor() {
-            editor.replaceCharacters(in: editor.selectedRange, with: pasted)
-            stringValue = editor.string
-        } else {
-            stringValue = pasted
-        }
-        pendingPasteCommit = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.window?.makeFirstResponder(nil)
-            if self.pendingPasteCommit {
-                self.pendingPasteCommit = false
-                self.onCommit?(self)
-            }
-        }
-    }
-
-    override func textDidBeginEditing(_ notification: Notification) {
-        super.textDidBeginEditing(notification)
-        onBegin?(self)
-    }
-
-    override func textDidEndEditing(_ notification: Notification) {
-        super.textDidEndEditing(notification)
-        pendingPasteCommit = false
-        onCommit?(self)
-    }
-}
+// MARK: - Main Controller
 
 final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
+    // MARK: - State
+
     var window: NSWindow!
     var root = NSStackView()
     var palette = darkPalette
     var isDark = true
     var isRebuilding = false
+
+    // Ticket editing guard
     var activeTicketInput: String?
     weak var activeTicketField: NSTextField?
     var pendingTicketInputRebuild = false
     var mouseDownMonitor: Any?
 
+    // View references
     var symbolButton: NSButton!
     var symbolMenuWidthConstraint: NSLayoutConstraint?
     var priceLabel: NSTextField!
@@ -1447,26 +47,23 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     var positionLabel: NSTextField!
     var eventLabel: NSTextField!
     var bidAskLabel: NSTextField!
-    var footerLastLabel: NSTextField?
-    var footerSnapshotLabel: NSTextField?
-    var footerApiDotLabel: NSTextField?
-    var footerApiNameLabel: NSTextField?
-    var footerStreamDotLabel: NSTextField?
-    var footerStreamNameLabel: NSTextField?
-    var footerMarketDotLabel: NSTextField?
-    var footerMarketNameLabel: NSTextField?
+    var footerStatusView: FooterStatusView?
     var workingOrdersScrollY: CGFloat = 0
     var workingOrdersRestoringScroll = false
     var workingOrdersScrollView: TrackingScrollView?
     var sellQuoteButton: QuoteButton?
     var buyQuoteButton: QuoteButton?
     var spreadButton: SpreadBadge?
-    var price = contracts["NQ"]!.price
+
+    // Market data
+    var price = contracts["MNQ"]!.price
     var bestBidPrice: Double?
     var bestAskPrice: Double?
     var lastQuoteAt: Date?
     var quoteSyncing = false
-    var avgPrice = contracts["NQ"]!.price - 10.5
+    var avgPrice = contracts["MNQ"]!.price - 10.5
+
+    // API / realtime state
     var apiClient: ProjectXClient?
     var realtimeClient = SignalRRealtimeClient(hub: "user")
     var marketClient = SignalRRealtimeClient(hub: "market")
@@ -1483,11 +80,15 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     var canTradeText = "READ ONLY"
     var openOrdersTitle = "OPEN ORDERS"
     var positionPrefix = "SYNC"
-    var selectedSymbol = "NQ"
+    var selectedSymbol = "MNQ"
     var balanceText = "--"
+
+    // Privacy toggles
     var hideBalance = false
     var hideRealizedPnl = false
     var hideAccount = false
+
+    // Ticket draft
     var orderSide = "BUY"
     var orderType = "MARKET"
     var orderQty = 1
@@ -1503,6 +104,8 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     var tpPriceOverride: Double?
     var slPriceOverride: Double?
     var bracketMode = "PRICE"
+
+    // Account / position snapshots
     var activeAccounts: [AccountInfo] = []
     var selectedAccountId: Int?
     var officialRealizedDayPnl: Double?
@@ -1516,6 +119,8 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     var protectionOrderGroups: [Int: String] = [:]
     var protectionGroupOrders: [String: Set<Int>] = [:]
     var protectionCancelIssuedGroups: Set<String> = []
+
+    // Sounds / fill dedupe
     private var tpSound: NSSound?
     private var orderSound: NSSound?
     private var lastProtectionFillWasTP = false
@@ -1531,7 +136,10 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     private var knownSnapshotTradeSoundKeys: Set<String>?
     private var snapshotTradeSoundAccountId: Int?
     private var suppressSnapshotFillSoundsUntil: Date?
+    private var recentLocalOrderAckSoundIds: [Int: Date] = [:]
     private var customSoundsLoadErrorReported = false
+
+    // Status / timers / UI overlays
     var hasRealtimeOrderState = false
     var accountRoleText = "LEAD UNSET"
     var dllText = "Pending"
@@ -1548,6 +156,11 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     var toastStack: [NSView] = []
     var recentOrderToastKeys: [String: Date] = [:]
     var statusItem: NSStatusItem?
+}
+
+extension PanelController {
+
+    // MARK: - App Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
@@ -1624,6 +237,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         setupStatusItem()
     }
 
+}
+
+extension PanelController {
+
+    // MARK: - Menu Bar / Input Monitoring
+
     func installMainMenu() {
         let mainMenu = NSMenu()
 
@@ -1686,6 +305,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         activeTicketField = nil
         commitTicketInput(field, id: id)
     }
+
+}
+
+extension PanelController {
+
+    // MARK: - Render / Rebuild
 
     func rebuild(disableAnimations: Bool = false, force: Bool = false) {
         if isRebuilding { return }
@@ -1782,582 +407,52 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
     }
 
+}
+
+extension PanelController {
+
+    // MARK: - View Factories
+
     func header() -> NSView {
-        let panel = NSView()
-        symbolButton = PillButton(symbolButtonTitle(selectedSymbol), bg: palette.surface2, fg: palette.text, size: 12)
-        symbolButton.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-        symbolButton.alignment = .center
-        symbolButton.target = self
-        symbolButton.action = #selector(showSymbolMenu(_:))
-        symbolButtonWidthStyle()
-        symbolMenuWidthConstraint = symbolButton.widthAnchor.constraint(equalToConstant: symbolMenuWidth(selectedSymbol))
-        symbolMenuWidthConstraint?.isActive = true
-        symbolButton.setContentCompressionResistancePriority(.required, for: .horizontal)
-
-        let priceBox = vstack(spacing: 0)
-        priceBox.alignment = .centerX
-        priceBox.addArrangedSubview(text("TSX LAST", 8, .medium, palette.muted))
-        priceLabel = digit("--", 16, .semibold, palette.green)
-        priceLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
-        priceBox.addArrangedSubview(priceLabel)
-
-        let quoteLive = marketStatusText == "Market Live" && !quoteSyncing
-        let live = text(quoteLive ? "● LIVE" : "● SYNC", 9, .semibold, quoteLive ? palette.green : palette.orange)
-        headerQuoteStatusLabel = live
-
-        let theme = PillButton(isDark ? "☾" : "☀", bg: palette.surface2, fg: isDark ? NSColor.white : NSColor.systemOrange, size: 13)
-        theme.fixedWidth(26)
-        theme.fixedHeight(24)
-        theme.target = self
-        theme.action = #selector(toggleTheme)
-
-        [symbolButton, priceBox, live, theme].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            panel.addSubview($0)
-        }
-
-        NSLayoutConstraint.activate([
-
-            symbolButton.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 8),
-            symbolButton.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-
-            theme.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -8),
-            theme.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-            live.trailingAnchor.constraint(equalTo: theme.leadingAnchor, constant: -8),
-            live.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-
-            priceBox.centerXAnchor.constraint(equalTo: panel.centerXAnchor),
-            priceBox.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-            priceBox.leadingAnchor.constraint(greaterThanOrEqualTo: symbolButton.trailingAnchor, constant: 8),
-            priceBox.trailingAnchor.constraint(lessThanOrEqualTo: live.leadingAnchor, constant: -8)
-        ])
-
-        let view = card(panel, pad: 6)
-        view.fixedHeight(46)
-        return view
+        return HeaderView(owner: self)
     }
 
     func accountCard() -> NSView {
-        let box = vstack(spacing: 6)
-        let top = hstack(spacing: 5)
-        let account = HoverPopUpButton()
-        var selectedAccountTitle = hideAccount ? anonymizedAccountName(accountName) : accountName
-        if activeAccounts.isEmpty {
-            account.addItems(withTitles: [selectedAccountTitle])
-        } else {
-            let titles = activeAccounts.map { hideAccount ? anonymizedAccountName($0.name) : $0.menuTitle }
-            account.addItems(withTitles: titles)
-            if let selectedAccountId,
-               let index = activeAccounts.firstIndex(where: { $0.id == selectedAccountId }) {
-                account.selectItem(at: index)
-                selectedAccountTitle = titles[index]
-            } else {
-                selectedAccountTitle = titles.first ?? selectedAccountTitle
-            }
-        }
-        account.target = self
-        account.action = #selector(accountChanged(_:))
-        stylePopup(account)
-        account.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
-        account.fixedWidth(accountPopupWidth(selectedAccountTitle, font: account.font ?? NSFont.systemFont(ofSize: 10, weight: .semibold)))
-        account.fixedHeight(22)
-        top.addArrangedSubview(account)
-        top.addArrangedSubview(spacer())
-
-        let canTradeColor = canTradeText == "CAN TRADE" ? palette.green : palette.orange
-        let tradeStatus = canTradeText == "CAN TRADE" ? "● TRADE" : "● LOCKED"
-        let tradeBadge = PillButton(tradeStatus, bg: NSColor.clear, fg: canTradeColor, size: 8, hoverable: false)
-        tradeBadge.toolTip = "TopstepX canTrade: \(canTradeText)"
-        top.addArrangedSubview(tradeBadge)
-
-        // Account privacy / anonymize toggle (masks last digits of account names for screenshots etc.)
-        let anonTitle = hideAccount ? "🙈" : "👁"
-        let anonBtn = PillButton(anonTitle, bg: alpha(palette.text, isDark ? 0.08 : 0.05), fg: palette.muted, size: 10)
-        anonBtn.fixedWidth(22)
-        anonBtn.fixedHeight(18)
-        anonBtn.target = self
-        anonBtn.action = #selector(toggleAccountPrivacy)
-        anonBtn.toolTip = hideAccount ? "Show full account names" : "Anonymize accounts (mask last digits)"
-        top.addArrangedSubview(anonBtn)
-
-        box.addArrangedSubview(top)
-
-        let stats = hstack(spacing: 10)
-        let balance = vstack(spacing: 2)
-        balance.alignment = .left
-        balance.fixedWidth(116)
-        let balanceLabel = text("BALANCE", 7, .medium, palette.muted)
-        balanceLabel.alignment = .left
-        balance.addArrangedSubview(balanceLabel)
-        let balanceButton = PillButton(displayBalanceText(), bg: NSColor.clear, fg: palette.text, size: 12)
-        balanceButton.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-        balanceButton.alignment = .left
-        balanceButton.target = self
-        balanceButton.action = #selector(toggleBalancePrivacy)
-        balanceButton.visualFeedback = false
-        balanceButton.fixedHeight(18)
-        balanceButton.fixedWidth(privacyPillWidth(displayBalanceText(), font: balanceButton.font ?? NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold), min: 62, max: 112))
-        balanceButton.layer?.cornerRadius = 6
-        balanceButton.imagePosition = .noImage
-        balanceButton.toolTip = hideBalance ? "Show balance" : "Hide balance"
-        balance.addArrangedSubview(balanceButton)
-        stats.addArrangedSubview(balance)
-        stats.addArrangedSubview(spacer())
-        let miniStats = hstack(spacing: 12)
-        miniStats.addArrangedSubview(compactMetric("POS", "\(effectivePositionCount())"))
-        miniStats.addArrangedSubview(compactMetric("ORD", "\(effectiveOrderCount())"))
-        stats.addArrangedSubview(miniStats)
-        box.addArrangedSubview(stats)
-
-        let status = hstack(spacing: 6)
-        status.addArrangedSubview(text("REST", 8, .regular, palette.muted))
-        status.addArrangedSubview(text(apiStatusText.contains("Connected") ? "● OK" : "● OFF", 8, .medium, apiStatusText.contains("Connected") ? palette.green : palette.orange))
-        status.addArrangedSubview(spacer())
-        status.addArrangedSubview(text(lastSyncText, 8, .regular, palette.muted))
-        box.addArrangedSubview(status)
-        return card(box)
+        return AccountCardView(owner: self)
     }
 
     func positionCard() -> NSView {
-        let box = vstack(spacing: 7)
-        let top = hstack(spacing: 6)
-        // Use per-symbol position for this view (not global account positions).
-        // This fixes showing MNQ position/PnL when NQ is selected, etc.
-        let hasCurrentPos = activePosition() != nil
-        let isFlat = !hasCurrentPos
-        let side = positionSideText()
-        let sideColor = side == "SHORT" ? palette.red : (isFlat ? palette.muted : palette.green)
-        let sidePill = PillButton(side, bg: alpha(sideColor, 0.14), fg: sideColor, size: 8, hoverable: false)
-        sidePill.fixedHeight(18)
-        top.addArrangedSubview(sidePill)
-
-        let identity = hstack(spacing: 4)
-        identity.addArrangedSubview(digit("\(positionSizeText())", 13, .semibold, palette.text))
-        identity.addArrangedSubview(text(selectedSymbol, 13, .semibold, palette.text))
-        top.addArrangedSubview(identity)
-        top.addArrangedSubview(spacer())
-        top.addArrangedSubview(text("U-PNL", 8, .medium, palette.muted))
-        pnlLabel = adaptiveDigit(positionPnlText(), base: 13, min: 10, weight: .semibold, color: positionPnlColor(), width: 76, alignment: .right)
-        top.addArrangedSubview(pnlLabel)
-        box.addArrangedSubview(top)
-
-        let details = hstack(spacing: 10)
-        details.addArrangedSubview(inlineMetric("Avg", averagePriceText(), width: 60))
-        details.addArrangedSubview(divider())
-        details.addArrangedSubview(privacyMetric("RP&L", displayRealizedPnlText(), width: 52, valueColor: displayRealizedPnlColor(), action: #selector(toggleRealizedPnlPrivacy), hidden: hideRealizedPnl))
-        details.addArrangedSubview(divider())
-        details.addArrangedSubview(inlineMetric("Protect", protectionStatusText(), width: 64))
-        details.addArrangedSubview(spacer())
-        box.addArrangedSubview(details)
-        return card(box)
+        return PositionCardView(owner: self)
     }
 
     func ticketCard() -> NSView {
-        let panel = NSView()
-        panel.fixedHeight(orderType == "LIMIT" ? 341 : 177)
-
-        let sellQuote = sideQuoteButton(side: "SELL")
-        let buyQuote = sideQuoteButton(side: "BUY")
-        let spread = spreadBadge()
-        sellQuoteButton = sellQuote
-        buyQuoteButton = buyQuote
-        spreadButton = spread
-
-        let selectedTabBg = alpha(palette.blue, isDark ? 0.36 : 0.20)
-        let inactiveTabBg = NSColor.clear
-        let market = PillButton("Market", bg: orderType == "MARKET" ? selectedTabBg : inactiveTabBg, fg: orderType == "MARKET" ? palette.text : palette.muted, size: 9)
-        let limit = PillButton("Limit", bg: orderType == "LIMIT" ? selectedTabBg : inactiveTabBg, fg: orderType == "LIMIT" ? palette.text : palette.muted, size: 9)
-        market.target = self
-        market.action = #selector(selectMarketOrder)
-        limit.target = self
-        limit.action = #selector(selectLimitOrder)
-        market.fixedHeight(22)
-        limit.fixedHeight(22)
-
-        let orderTypeTabs = NSView()
-        orderTypeTabs.wantsLayer = true
-        orderTypeTabs.layer?.cornerRadius = 8
-        orderTypeTabs.layer?.backgroundColor = alpha(palette.surface2, isDark ? 0.62 : 0.86).cgColor
-        orderTypeTabs.layer?.borderWidth = 1
-        orderTypeTabs.layer?.borderColor = alpha(palette.border, 0.55).cgColor
-
-        let priceRow = orderType == "LIMIT" ? limitPriceRow() : zeroHeightView()
-
-        let minus = PillButton("−", bg: palette.surface2, fg: palette.text, size: 13)
-        let plus = PillButton("+", bg: palette.surface2, fg: palette.text, size: 13)
-        minus.target = self
-        minus.action = #selector(decrementQty)
-        plus.target = self
-        plus.action = #selector(incrementQty)
-        let qtyRow = quantityAndQuickQtyRow(minus: minus, plus: plus)
-        let qtyQuickRow = zeroHeightView()
-
-        let bracketRow = orderType == "LIMIT" ? protectionRow() : zeroHeightView()
-
-        let risk = orderType == "LIMIT" ? card(ticketRiskSummary(), pad: 6, color: palette.surface2) : zeroHeightView()
-        if orderType == "LIMIT" {
-            risk.fixedHeight(24)
-        }
-
-        let actionColor = isOppositeOpenPositionOrder(side: orderSide) ? palette.orange : (orderSide == "BUY" ? palette.green : palette.red)
-        let submit = PillButton(orderSubmitTitle(), bg: readOnlyActionColor(actionColor), fg: readOnlyActionTextColor(), size: 11)
-        submit.target = self
-        submit.action = orderSide == "BUY" ? #selector(buyClicked) : #selector(sellClicked)
-        submit.isEnabled = !quoteSyncing
-        submit.fixedHeight(38)
-
-        [sellQuote, buyQuote, spread, orderTypeTabs, priceRow, qtyRow, qtyQuickRow, bracketRow, risk, submit].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            panel.addSubview($0)
-        }
-        [market, limit].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            orderTypeTabs.addSubview($0)
-        }
-
-        NSLayoutConstraint.activate([
-            sellQuote.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            sellQuote.topAnchor.constraint(equalTo: panel.topAnchor),
-            sellQuote.trailingAnchor.constraint(equalTo: panel.centerXAnchor, constant: -1),
-            buyQuote.leadingAnchor.constraint(equalTo: panel.centerXAnchor, constant: 1),
-            buyQuote.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            buyQuote.centerYAnchor.constraint(equalTo: sellQuote.centerYAnchor),
-            spread.centerXAnchor.constraint(equalTo: panel.centerXAnchor),
-            spread.centerYAnchor.constraint(equalTo: sellQuote.centerYAnchor),
-
-            orderTypeTabs.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            orderTypeTabs.topAnchor.constraint(equalTo: sellQuote.bottomAnchor, constant: 6),
-            orderTypeTabs.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            orderTypeTabs.heightAnchor.constraint(equalToConstant: 24),
-
-            market.leadingAnchor.constraint(equalTo: orderTypeTabs.leadingAnchor, constant: 2),
-            market.topAnchor.constraint(equalTo: orderTypeTabs.topAnchor, constant: 1),
-            market.bottomAnchor.constraint(equalTo: orderTypeTabs.bottomAnchor, constant: -1),
-            market.trailingAnchor.constraint(equalTo: orderTypeTabs.centerXAnchor, constant: -1),
-            limit.leadingAnchor.constraint(equalTo: orderTypeTabs.centerXAnchor, constant: 1),
-            limit.trailingAnchor.constraint(equalTo: orderTypeTabs.trailingAnchor, constant: -2),
-            limit.centerYAnchor.constraint(equalTo: market.centerYAnchor),
-
-            priceRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            priceRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            priceRow.topAnchor.constraint(equalTo: orderTypeTabs.bottomAnchor, constant: orderType == "LIMIT" ? 7 : 0),
-
-            qtyRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            qtyRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            qtyRow.topAnchor.constraint(equalTo: priceRow.bottomAnchor, constant: orderType == "LIMIT" ? 12 : 8),
-
-            qtyQuickRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            qtyQuickRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            qtyQuickRow.topAnchor.constraint(equalTo: qtyRow.bottomAnchor),
-
-            bracketRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            bracketRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            bracketRow.topAnchor.constraint(equalTo: qtyQuickRow.bottomAnchor, constant: orderType == "LIMIT" ? 7 : 0),
-
-            risk.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            risk.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            risk.topAnchor.constraint(equalTo: bracketRow.bottomAnchor, constant: orderType == "LIMIT" ? 7 : 0),
-
-            submit.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            submit.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            submit.topAnchor.constraint(equalTo: risk.bottomAnchor, constant: orderType == "LIMIT" ? 7 : 8)
-        ])
-
-        return card(panel)
+        return OrderTicketView(owner: self)
     }
 
     func openOrdersCard() -> NSView {
-        let box = vstack(spacing: 8)
-        let orders = workingOrders()
-        let orderCount = orders.count
-        let positionCount = effectivePositionCount()
-        let hasOrders = orderCount > 0
-        let hasPosition = positionCount > 0
-
-        let head = hstack(spacing: 7)
-        head.addArrangedSubview(text("WORKING ORDERS", 9, .medium, alpha(palette.text, 0.88)))
-        head.addArrangedSubview(orderCountText(count: orderCount))
-        head.addArrangedSubview(spacer())
-        head.addArrangedSubview(orderDataSourcePill())
-        box.addArrangedSubview(head)
-
-        if lastSnapshot != nil {
-            if orderCount == 0 {
-                box.addArrangedSubview(openOrdersEmptyState())
-            } else {
-                box.addArrangedSubview(openOrdersList(orders))
-            }
-        } else {
-            box.addArrangedSubview(openOrdersStatusState("Loading orders from API..."))
-        }
-
-        box.addArrangedSubview(orderActionRow(hasOrders: hasOrders, hasPosition: hasPosition))
-        return card(box)
+        return WorkingOrdersSectionView(owner: self)
     }
 
     func footer() -> NSView {
-        let box = hstack(spacing: 10)
-        box.addArrangedSubview(footerConnectionStrip())
-        box.addArrangedSubview(spacer())
-
-        let meta = vstack(spacing: 3)
-        meta.alignment = .trailing
-        let top = hstack(spacing: 6)
-        let last = text(lastSyncText, 8, .semibold, palette.text)
-        footerLastLabel = last
-        top.addArrangedSubview(last)
-        top.addArrangedSubview(shortDivider())
-        eventLabel = text("Ready", 8, .regular, palette.muted)
-        eventLabel.lineBreakMode = .byTruncatingTail
-        eventLabel.maximumNumberOfLines = 1
-        eventLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        top.addArrangedSubview(eventLabel)
-        meta.addArrangedSubview(top)
-
-        let snapshot = text(snapshotStatusText, 8, .regular, palette.muted)
-        footerSnapshotLabel = snapshot
-        meta.addArrangedSubview(snapshot)
-        box.addArrangedSubview(meta)
-        let view = card(box, pad: 7)
-        updateFooterStatus()
+        let view = FooterStatusView(
+            palette: palette,
+            isDark: isDark,
+            lastSyncText: lastSyncText,
+            snapshotStatusText: snapshotStatusText,
+            apiLive: apiStatusText.contains("Connected"),
+            streamLive: streamStatusText.contains("Live"),
+            marketLive: marketStatusText.contains("Live") && !quoteSyncing
+        )
+        footerStatusView = view
+        eventLabel = view.eventLabel
         return view
     }
 
-    func orderCountText(count: Int) -> NSTextField {
-        let label = text("\(count)", 9, .medium, count > 0 ? palette.orange : alpha(palette.muted, 0.86))
-        label.alignment = .left
-        return label
-    }
+}
 
-    func orderDisclosureButton() -> NSButton {
-        let button = PillButton("⌄", bg: alpha(palette.text, isDark ? 0.05 : 0.08), fg: palette.muted, size: 10, hoverable: false)
-        button.fixedWidth(22)
-        button.fixedHeight(18)
-        button.layer?.cornerRadius = 9
-        button.isEnabled = false
-        return button
-    }
+extension PanelController {
 
-    func orderDataSourcePill() -> NSView {
-        let live = hasRealtimeOrderState
-        let restFailed = snapshotStatusText.lowercased().contains("failed") || snapshotStatusText.lowercased().contains("off")
-        let restLoading = !live && lastSnapshot == nil
-        let statusColor: NSColor = live ? palette.green : (restFailed ? palette.red : (restLoading ? palette.orange : palette.green))
-        let dot = text("●", 7, .semibold, statusColor)
-        let label = text(live ? "STREAM" : "REST", 7.5, .semibold, live ? palette.text : (restFailed ? palette.red : palette.text))
-        let detail = text(live ? "live" : (restFailed ? "failed" : (restLoading ? "loading" : "snapshot")), 7.5, .medium, alpha(restFailed ? palette.red : palette.muted, restFailed ? 0.92 : 0.82))
-        let row = hstack(spacing: 4)
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 7, bottom: 0, right: 7)
-        row.addArrangedSubview(dot)
-        row.addArrangedSubview(label)
-        row.addArrangedSubview(detail)
-        row.wantsLayer = true
-        row.layer?.cornerRadius = 8
-        row.layer?.backgroundColor = alpha(statusColor, live ? 0.10 : (restFailed ? 0.10 : 0.07)).cgColor
-        row.layer?.borderWidth = 1
-        row.layer?.borderColor = alpha(statusColor, live ? 0.22 : 0.26).cgColor
-        row.fixedHeight(17)
-        return row
-    }
-
-    func orderStatePill(count: Int) -> NSButton {
-        let active = count > 0
-        let color = active ? palette.orange : palette.muted
-        let button = PillButton(active ? "\(count) WORKING" : "CLEAR", bg: alpha(color, active ? 0.16 : 0.10), fg: color, size: 8)
-        button.fixedHeight(18)
-        button.fixedWidth(active ? 74 : 48)
-        button.layer?.cornerRadius = 9
-        button.isEnabled = false
-        return button
-    }
-
-    func openOrdersEmptyState() -> NSView {
-        return openOrdersStatusState("No working orders")
-    }
-
-    func openOrdersStatusState(_ message: String) -> NSView {
-        let box = NSView()
-        box.fixedHeight(34)
-        let label = text(message, 10, .medium, alpha(palette.muted, 0.92))
-        label.alignment = .center
-        label.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: box.centerYAnchor)
-        ])
-        return box
-    }
-
-    func orderActionRow(hasOrders: Bool, hasPosition: Bool) -> NSView {
-        let cancel = riskActionButton("Cancel All Orders", color: palette.orange, active: hasOrders && liveTradingEnabled())
-        let flatten = riskActionButton("Flatten Position", color: palette.red, active: hasPosition && liveTradingEnabled())
-        cancel.fixedWidth(105)
-        flatten.fixedWidth(105)
-        cancel.target = self
-        cancel.action = #selector(cancelAllOrdersClicked)
-        flatten.target = self
-        flatten.action = #selector(flattenPositionClicked)
-
-        let buttons = hstack(spacing: 8)
-        buttons.addArrangedSubview(cancel)
-        buttons.addArrangedSubview(flatten)
-
-        // Center the buttons with good side margins for symmetric, professional look.
-        // The container will be stretched by parent card, but buttons stay centered with breathing room from edges.
-        let container = NSView()
-        container.addSubview(buttons)
-        buttons.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            buttons.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            buttons.topAnchor.constraint(equalTo: container.topAnchor),
-            buttons.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            buttons.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 20),
-            buttons.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -20),
-        ])
-        return container
-    }
-
-    func openOrdersList(_ orders: [[String: Any]]) -> NSView {
-        let list = vstack(spacing: 0)
-        list.addArrangedSubview(workingOrdersTableHeader())
-        for order in orders {
-            list.addArrangedSubview(workingOrderRow(order))
-        }
-        if orders.count <= 3 {
-            workingOrdersScrollY = 0
-            workingOrdersScrollView = nil
-            return workingOrdersListContainer(list, height: CGFloat(20 + orders.count * 27))
-        }
-
-        // Let the list compute its exact height from actual row sizes (more accurate than *41)
-        list.layoutSubtreeIfNeeded()
-
-        let scroll = TrackingScrollView()
-        workingOrdersRestoringScroll = true   // prevent initial layout reflects from overwriting the saved user y with 0 or other
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = false
-        scroll.drawsBackground = false
-        scroll.borderType = .noBorder
-        scroll.autohidesScrollers = false
-        scroll.onScroll = { [weak self] y in
-            guard let self, !self.workingOrdersRestoringScroll else { return }
-            self.workingOrdersScrollY = y
-        }
-
-        let document = NSView()
-        document.translatesAutoresizingMaskIntoConstraints = false
-        list.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(list)
-        scroll.documentView = document
-        NSLayoutConstraint.activate([
-            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            document.heightAnchor.constraint(equalToConstant: list.fittingSize.height),
-            list.leadingAnchor.constraint(equalTo: document.leadingAnchor),
-            list.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -10),
-            list.topAnchor.constraint(equalTo: document.topAnchor),
-            list.bottomAnchor.constraint(equalTo: document.bottomAnchor)
-        ])
-        scroll.fixedHeight(104)
-        workingOrdersScrollView = scroll
-        return scroll
-    }
-
-    func workingOrderRow(_ order: [String: Any]) -> NSView {
-        let side = orderSideText(order)
-        let sideColor = side == "BUY" ? palette.green : palette.red
-        let status = orderStatusText(order)
-        let statusColor = ["Open", "Working", "Pending"].contains(status) ? palette.green : palette.muted
-        let edit = orderRowButton("✎", color: palette.blue, action: #selector(editWorkingOrder(_:)), order: order)
-        let cancel = orderRowButton("×", color: palette.orange, action: #selector(cancelWorkingOrder(_:)), order: order)
-
-        let row = workingOrdersTableRowBase()
-        row.wantsLayer = true
-        row.layer?.backgroundColor = alpha(palette.text, isDark ? 0.025 : 0.045).cgColor
-        row.addArrangedSubview(orderColumn(shortOrderIdText(order), width: 48, color: palette.text, weight: .medium))
-        row.addArrangedSubview(orderColumn(side, width: 30, color: sideColor, weight: .semibold))
-        row.addArrangedSubview(orderColumn(orderCompactTypeText(order), width: 32, color: palette.text, weight: .semibold))
-        row.addArrangedSubview(orderColumn("\(intValue(order["size"]) ?? 0)", width: 22, color: palette.text, weight: .medium, align: .center, digitFont: true))
-        row.addArrangedSubview(orderColumn(orderDisplayPriceText(order), width: 62, color: palette.text, weight: .medium, align: .center, digitFont: true))
-        row.addArrangedSubview(orderColumn(status.uppercased(), width: 36, color: statusColor, weight: .semibold, size: 7, align: .center))
-        row.addArrangedSubview(spacer())
-        row.addArrangedSubview(orderActionCluster(edit, cancel))
-
-        let outer = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        outer.addSubview(row)
-        NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: outer.leadingAnchor),
-            row.trailingAnchor.constraint(equalTo: outer.trailingAnchor),
-            row.topAnchor.constraint(equalTo: outer.topAnchor),
-            row.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
-            outer.heightAnchor.constraint(equalToConstant: 27)
-        ])
-        return outer
-    }
-
-    func workingOrdersTableHeader() -> NSView {
-        let row = workingOrdersTableRowBase()
-        row.addArrangedSubview(orderHeaderColumn("ID", width: 48))
-        row.addArrangedSubview(orderHeaderColumn("SIDE", width: 30))
-        row.addArrangedSubview(orderHeaderColumn("TYPE", width: 32))
-        row.addArrangedSubview(orderHeaderColumn("QTY", width: 22, align: .center))
-        row.addArrangedSubview(orderHeaderColumn("PRICE", width: 62, align: .center))
-        row.addArrangedSubview(orderHeaderColumn("STATUS", width: 36, align: .center))
-        row.addArrangedSubview(spacer())
-        let actions = hstack(spacing: 8)
-        actions.fixedWidth(44)
-        actions.addArrangedSubview(orderHeaderColumn("E", width: 16, align: .center))
-        actions.addArrangedSubview(orderHeaderColumn("X", width: 16, align: .center))
-        row.addArrangedSubview(actions)
-
-        let outer = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        outer.addSubview(row)
-        NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: outer.leadingAnchor),
-            row.trailingAnchor.constraint(equalTo: outer.trailingAnchor),
-            row.topAnchor.constraint(equalTo: outer.topAnchor),
-            row.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
-            outer.heightAnchor.constraint(equalToConstant: 20)
-        ])
-        return outer
-    }
-
-    func workingOrdersTableRowBase() -> NSStackView {
-        let row = hstack(spacing: 4)
-        row.alignment = .centerY
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-        return row
-    }
-
-    func orderActionCluster(_ edit: NSButton, _ cancel: NSButton) -> NSStackView {
-        let actions = hstack(spacing: 8)
-        actions.fixedWidth(44)
-        actions.addArrangedSubview(edit)
-        actions.addArrangedSubview(cancel)
-        return actions
-    }
-
-    func workingOrdersListContainer(_ list: NSView, height: CGFloat) -> NSView {
-        let container = NSView()
-        list.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(list)
-        NSLayoutConstraint.activate([
-            list.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            list.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            list.topAnchor.constraint(equalTo: container.topAnchor),
-            list.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            container.heightAnchor.constraint(equalToConstant: height)
-        ])
-        container.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        container.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return container
-    }
-
-    func orderHeaderColumn(_ value: String, width: CGFloat, align: NSTextAlignment = .left) -> NSTextField {
-        return orderColumn(value, width: width, color: palette.muted, weight: .semibold, size: 7, align: align)
-    }
+    // MARK: - Working Orders Display Helpers
 
     func orderColumn(_ value: String, width: CGFloat, color: NSColor, weight: NSFont.Weight, size: CGFloat = 8, align: NSTextAlignment = .left, digitFont: Bool = false) -> NSTextField {
         let label = text(value, size, weight, color)
@@ -2388,75 +483,27 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         button.layer?.borderWidth = 1
         button.layer?.borderColor = alpha(fg, active ? 0.85 : 0.35).cgColor
         button.isEnabled = active
-        (button as? PillButton)?.captureBaseBorder()
+        button.captureBaseBorder()
         return button
     }
 
-    func statusPill(_ name: String, value: String, live: Bool) -> NSButton {
-        let color = live ? palette.green : palette.muted
-        let title = "\(name) \(value)"
-        let button = PillButton(title, bg: alpha(color, live ? 0.13 : 0.08), fg: color, size: 8)
-        button.fixedHeight(18)
-        button.layer?.cornerRadius = 9
-        button.isEnabled = false
-        return button
-    }
+}
 
-    func connectionState(_ name: String, live: Bool) -> NSView {
-        let row = hstack(spacing: 4)
-        let color = live ? palette.green : palette.muted
-        row.addArrangedSubview(text("●", 7, .semibold, color))
-        row.addArrangedSubview(text(name, 8, .regular, live ? palette.text : palette.muted))
-        return row
-    }
+extension PanelController {
 
-    func footerConnectionState(_ name: String, live: Bool) -> NSView {
-        let row = hstack(spacing: 4)
-        let color = live ? palette.green : palette.muted
-        let dot = text("●", 7, .semibold, color)
-        let label = text(name, 8, .regular, live ? palette.text : palette.muted)
-        switch name {
-        case "API":
-            footerApiDotLabel = dot
-            footerApiNameLabel = label
-        case "Stream":
-            footerStreamDotLabel = dot
-            footerStreamNameLabel = label
-        case "Market":
-            footerMarketDotLabel = dot
-            footerMarketNameLabel = label
-        default:
-            break
-        }
-        row.addArrangedSubview(dot)
-        row.addArrangedSubview(label)
-        return row
-    }
-
-    func footerConnectionStrip() -> NSView {
-        let row = hstack(spacing: 8)
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 7, bottom: 0, right: 7)
-        row.wantsLayer = true
-        row.layer?.cornerRadius = 9
-        row.layer?.backgroundColor = alpha(palette.text, isDark ? 0.035 : 0.055).cgColor
-        row.layer?.borderWidth = 1
-        row.layer?.borderColor = alpha(palette.border, 0.28).cgColor
-        row.addArrangedSubview(footerConnectionState("API", live: apiStatusText.contains("Connected")))
-        row.addArrangedSubview(footerConnectionState("Stream", live: streamStatusText.contains("Live")))
-        row.addArrangedSubview(footerConnectionState("Market", live: marketStatusText.contains("Live")))
-        row.fixedHeight(21)
-        return row
-    }
+    // MARK: - Status Updates
 
     func updateFooterStatus() {
-        footerLastLabel?.stringValue = lastSyncText
-        footerLastLabel?.textColor = palette.text
-        footerSnapshotLabel?.stringValue = snapshotStatusText
-        footerSnapshotLabel?.textColor = palette.muted
         updateHeaderQuoteStatus()
-        updateFooterConnection(dot: footerApiDotLabel, label: footerApiNameLabel, live: apiStatusText.contains("Connected"))
-        updateFooterConnection(dot: footerStreamDotLabel, label: footerStreamNameLabel, live: streamStatusText.contains("Live"))
-        updateFooterConnection(dot: footerMarketDotLabel, label: footerMarketNameLabel, live: marketStatusText.contains("Live") && !quoteSyncing)
+        footerStatusView?.update(
+            palette: palette,
+            isDark: isDark,
+            lastSyncText: lastSyncText,
+            snapshotStatusText: snapshotStatusText,
+            apiLive: apiStatusText.contains("Connected"),
+            streamLive: streamStatusText.contains("Live"),
+            marketLive: marketStatusText.contains("Live") && !quoteSyncing
+        )
     }
 
     func updateHeaderQuoteStatus() {
@@ -2465,11 +512,11 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         headerQuoteStatusLabel?.textColor = live ? palette.green : palette.orange
     }
 
-    func updateFooterConnection(dot: NSTextField?, label: NSTextField?, live: Bool) {
-        let color = live ? palette.green : palette.muted
-        dot?.textColor = color
-        label?.textColor = live ? palette.text : palette.muted
-    }
+}
+
+extension PanelController {
+
+    // MARK: - Working Orders State
 
     func workingOrders() -> [[String: Any]] {
         var byId: [Int: [String: Any]] = [:]
@@ -2621,7 +668,8 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             lastProtectionFillSound = (id, Date())
         }
 
-        showTradeToast(title, subtitle: subtitle, color: status == 3 ? palette.orange : color)
+        let suppressRealtimeSound = status != 2 && shouldSuppressRealtimeOrderSound(orderId: id)
+        showTradeToast(title, subtitle: subtitle, color: status == 3 ? palette.orange : color, playSound: !suppressRealtimeSound)
         if status == 2 {
             markFillSoundPlayed(key: "order-\(id)")
         }
@@ -2670,12 +718,33 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return true
     }
 
+    func markLocalOrderAckSound(orderIds: [Int]) {
+        let now = Date()
+        recentLocalOrderAckSoundIds = recentLocalOrderAckSoundIds.filter { now.timeIntervalSince($0.value) < 8 }
+        for id in orderIds where id > 0 {
+            recentLocalOrderAckSoundIds[id] = now
+        }
+    }
+
+    func shouldSuppressRealtimeOrderSound(orderId: Int) -> Bool {
+        let now = Date()
+        recentLocalOrderAckSoundIds = recentLocalOrderAckSoundIds.filter { now.timeIntervalSince($0.value) < 8 }
+        guard let previous = recentLocalOrderAckSoundIds[orderId] else { return false }
+        return now.timeIntervalSince(previous) < 6
+    }
+
     func intValue(_ value: Any?) -> Int? {
         if let value = value as? Int { return value }
         if let value = value as? NSNumber { return value.intValue }
         if let value = value as? String { return Int(value) }
         return nil
     }
+
+}
+
+extension PanelController {
+
+    // MARK: - Snapshot / API Refresh
 
     func updateSymbol(resetPrice: Bool = true) {
         let key = selectedSymbol
@@ -2820,6 +889,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
     }
 
+}
+
+extension PanelController {
+
+    // MARK: - Timers / Rendering Updates
+
     func timeStamp() -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -2859,6 +934,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
     }
 
+}
+
+extension PanelController {
+
+    // MARK: - Symbol / Account Selection
+
     @objc func showSymbolMenu(_ sender: NSButton) {
         let menu = NSMenu()
         for symbol in supportedSymbols {
@@ -2872,7 +953,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     }
 
     @objc func symbolChanged(_ sender: NSMenuItem) {
-        selectedSymbol = (sender.representedObject as? String) ?? sender.title
+        let requestedSymbol = (sender.representedObject as? String) ?? sender.title
+        guard supportedSymbols.contains(requestedSymbol) else {
+            eventLabel?.stringValue = "\(requestedSymbol) is not supported"
+            return
+        }
+        selectedSymbol = requestedSymbol
         marketStatusText = "Market Syncing"
         quoteSyncing = true
         realtimeContractId = nil
@@ -2964,6 +1050,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         startRealtimeIfNeeded(accountId: account.id, force: true)
         refreshReadOnly()
     }
+
+}
+
+extension PanelController {
+
+    // MARK: - Realtime Streams
 
     func startRealtimeIfNeeded(accountId: Int?, force: Bool) {
         guard let apiClient, let accountId else {
@@ -3115,6 +1207,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
     }
 
+}
+
+extension PanelController {
+
+    // MARK: - Realtime Payload Handlers
+
     func applyMarketQuote(contractId: String, _ quote: [String: Any]) {
         guard contractId == realtimeContractId else { return }
         let nextPrice = numberValue(quote["lastPrice"]) ?? numberValue(quote["price"])
@@ -3142,6 +1240,9 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         lastSyncText = "Last \(timeStamp())"
         updateFooterStatus()
         render(direction: direction)
+        if wasSyncing && !quoteSyncing {
+            scheduleRebuild()
+        }
     }
 
     func numberValue(_ value: Any?) -> Double? {
@@ -3465,6 +1566,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         officialUnrealizedPnl = nil
     }
 
+}
+
+extension PanelController {
+
+    // MARK: - Position / Account Calculations
+
     func effectiveOrderCount() -> Int {
         return workingOrders().count
     }
@@ -3740,6 +1847,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
     }
 
+}
+
+extension PanelController {
+
+    // MARK: - Panel Actions
+
     @objc func toggleTheme() {
         isDark.toggle()
         rebuild(force: true)
@@ -3854,6 +1967,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
         rebuild(force: true)
     }
+
+}
+
+extension PanelController {
+
+    // MARK: - Trading Actions
 
     @objc func buyClicked() {
         submitOrder(side: "BUY")
@@ -3997,6 +2116,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
                 case .success(let ids):
                     self.registerProtectionGroup(orderIds: ids, payloads: payloads)
                     self.setEvent("PROTECT SENT: \(summary)", color: self.palette.green)
+                    self.markLocalOrderAckSound(orderIds: ids)
                     let toastTitle: String
                     if wasTP && wasSL {
                         toastTitle = "TP/SL sent"
@@ -4075,6 +2195,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
     }
 
+}
+
+extension PanelController {
+
+    // MARK: - Order Mutation Helpers
+
     @objc func cancelAllOrdersClicked() {
         cancelAllWorkingOrders(closeAfterCancel: false)
     }
@@ -4102,6 +2228,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
                 case .success:
                     self.clearEditingOrder(orderId: orderId)
                     self.setEvent("CANCEL SENT: #\(orderId)", color: self.palette.green)
+                    self.markLocalOrderAckSound(orderIds: [orderId])
                     self.showTradeToast("Order cancel sent", subtitle: "#\(orderId)", color: self.palette.orange)
                     self.refreshAfterTradeMutation()
                 }
@@ -4171,6 +2298,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
                             self.tradeRequestInFlight = false
                             self.eventLabel?.stringValue = "CANCEL SENT: \(orderIds.count) order(s)"
                             self.eventLabel?.textColor = self.palette.green
+                            self.markLocalOrderAckSound(orderIds: orderIds)
                             self.showTradeToast("Canceled \(orderIds.count)", subtitle: "TopstepX accepted", color: self.palette.orange)
                             self.refreshAfterTradeMutation()
                         }
@@ -4242,6 +2370,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             }
         }
     }
+
+}
+
+extension PanelController {
+
+    // MARK: - Order Payloads / Protection
 
     func positionProtectionPayloads(side: String) throws -> [[String: Any]] {
         var payloads: [[String: Any]] = []
@@ -4383,853 +2517,11 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         ]
     }
 
-    func text(_ value: String, _ size: CGFloat, _ weight: NSFont.Weight, _ color: NSColor) -> NSTextField {
-        let field = NSTextField(labelWithString: value)
-        field.font = NSFont.systemFont(ofSize: size, weight: weight)
-        field.textColor = color
-        field.lineBreakMode = .byTruncatingTail
-        return field
-    }
+}
 
-    func digit(_ value: String, _ size: CGFloat, _ weight: NSFont.Weight, _ color: NSColor) -> NSTextField {
-        let field = NSTextField(labelWithString: value)
-        field.font = NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
-        field.textColor = color
-        field.lineBreakMode = .byTruncatingTail
-        return field
-    }
+extension PanelController {
 
-    func adaptiveDigit(_ value: String, base: CGFloat, min: CGFloat, weight: NSFont.Weight, color: NSColor, width: CGFloat, alignment: NSTextAlignment) -> NSTextField {
-        let field = digit(value, adaptiveSize(for: value, base: base, min: min), weight, color)
-        field.alignment = alignment
-        field.fixedWidth(width)
-        field.setContentCompressionResistancePriority(.required, for: .horizontal)
-        return field
-    }
-
-    func adaptiveSize(for value: String, base: CGFloat, min: CGFloat) -> CGFloat {
-        let count = value.count
-        if count <= 8 { return base }
-        if count <= 10 { return max(min, base - 1) }
-        if count <= 12 { return max(min, base - 2) }
-        return min
-    }
-
-    func metric(_ name: String, _ value: String, _ color: NSColor) -> NSView {
-        let box = vstack(spacing: 5)
-        box.addArrangedSubview(text(name, 8, .regular, palette.muted))
-        box.addArrangedSubview(digit(value, 12, .semibold, color))
-        return box
-    }
-
-    func compactMetric(_ name: String, _ value: String) -> NSView {
-        let box = vstack(spacing: 2)
-        box.alignment = .right
-        box.addArrangedSubview(text(name, 7, .medium, palette.muted))
-        box.addArrangedSubview(digit(value, 11, .semibold, palette.muted))
-        box.fixedWidth(32)
-        return box
-    }
-
-    func positionMetric(_ name: String, _ value: String, _ color: NSColor) -> NSView {
-        let box = vstack(spacing: 2)
-        box.alignment = .centerX
-        let label = text(name, 7, .medium, palette.muted)
-        label.alignment = .center
-        let val = digit(value, 11, .semibold, color)
-        val.alignment = .center
-        box.addArrangedSubview(label)
-        box.addArrangedSubview(val)
-        return box
-    }
-
-    func inlineMetric(_ name: String, _ value: String, width: CGFloat, valueColor: NSColor? = nil) -> NSView {
-        let row = hstack(spacing: 4)
-        row.addArrangedSubview(text(name, 8, .regular, palette.muted))
-        let color = valueColor ?? (value == "None" || value == "--" ? palette.muted : palette.text)
-        row.addArrangedSubview(adaptiveDigit(value, base: 10, min: 8, weight: .semibold, color: color, width: width, alignment: .left))
-        return row
-    }
-
-    func privacyMetric(_ name: String, _ value: String, width: CGFloat, valueColor: NSColor, action: Selector, hidden: Bool) -> NSView {
-        let row = hstack(spacing: 4)
-        row.addArrangedSubview(text(name, 8, .regular, palette.muted))
-        let slot = NSView()
-        slot.fixedWidth(width)
-        slot.fixedHeight(14)
-
-        let label = digit(value, adaptiveSize(for: value, base: 10, min: 8), .semibold, valueColor)
-        label.alignment = .left
-        label.lineBreakMode = .byTruncatingTail
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        label.translatesAutoresizingMaskIntoConstraints = false
-
-        let hit = HoverProxyButton()
-        hit.target = self
-        hit.action = action
-        hit.toolTip = hidden ? "Show \(name)" : "Hide \(name)"
-        hit.translatesAutoresizingMaskIntoConstraints = false
-
-        slot.addSubview(label)
-        slot.addSubview(hit)
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: slot.leadingAnchor),
-            label.trailingAnchor.constraint(equalTo: slot.trailingAnchor),
-            label.centerYAnchor.constraint(equalTo: slot.centerYAnchor),
-            hit.leadingAnchor.constraint(equalTo: slot.leadingAnchor),
-            hit.trailingAnchor.constraint(equalTo: slot.trailingAnchor),
-            hit.topAnchor.constraint(equalTo: slot.topAnchor),
-            hit.bottomAnchor.constraint(equalTo: slot.bottomAnchor)
-        ])
-
-        row.addArrangedSubview(slot)
-        return row
-    }
-
-    func privacyPillWidth(_ value: String, font: NSFont, min: CGFloat, max: CGFloat) -> CGFloat {
-        let textWidth = (value as NSString).size(withAttributes: [.font: font]).width
-        return Swift.min(Swift.max(ceil(textWidth + 12), min), max)
-    }
-
-    func displayBalanceText() -> String {
-        return hideBalance ? "*****" : balanceText
-    }
-
-    func displayRealizedPnlText() -> String {
-        return hideRealizedPnl ? "*****" : officialDayNetText()
-    }
-
-    func displayRealizedPnlColor() -> NSColor {
-        return hideRealizedPnl ? palette.muted : officialDayNetColor()
-    }
-
-    func anonymizedAccountName(_ name: String) -> String {
-        var compact = name.replacingOccurrences(of: "-219616-", with: "-")
-        // Anonymize last 4 (or more) trailing digits with •••• for privacy/screenshots
-        if let range = compact.range(of: #"\d{3,}$"#, options: .regularExpression) {
-            let digits = String(compact[range])
-            let visible = max(0, digits.count - 4)
-            let masked = String(digits.prefix(visible)) + String(repeating: "•", count: 4)
-            compact.replaceSubrange(range, with: masked)
-        } else if compact.count > 6 {
-            // Fallback: mask last 4 characters
-            compact = String(compact.dropLast(4)) + "••••"
-        }
-        if compact.count > 22 {
-            compact = String(compact.prefix(19)) + "..."
-        }
-        return compact
-    }
-
-    func sideQuoteButton(side: String) -> QuoteButton {
-        let selected = orderSide == side
-        let color = side == "BUY" ? palette.green : palette.red
-        let bg = selected ? alpha(color, isDark ? 0.42 : 0.18) : alpha(color, isDark ? 0.16 : 0.07)
-        let fg = quoteTextColor(side: side)
-        let button = QuoteButton(side: side, price: quotePriceText(side: side), bg: bg, fg: fg)
-        button.fixedHeight(44)
-        button.layer?.borderWidth = selected ? 1 : 0.5
-        button.layer?.borderColor = alpha(color, selected ? 0.75 : 0.35).cgColor
-        button.target = self
-        button.action = side == "BUY" ? #selector(selectBuySide) : #selector(selectSellSide)
-        return button
-    }
-
-    func quotePriceText(side: String) -> String {
-        if quoteSyncing { return "--" }
-        let value = side == "BUY" ? displayAskPrice() : displayBidPrice()
-        return value.map(number2) ?? "--"
-    }
-
-    func quoteTextColor(side: String) -> NSColor {
-        let selected = orderSide == side
-        if selected {
-            if isDark { return NSColor.white }
-            return side == "BUY" ? palette.green : palette.red
-        }
-        return side == "BUY" ? palette.green : palette.red
-    }
-
-    func spreadBadge() -> SpreadBadge {
-        let bg = isDark
-            ? NSColor(calibratedRed: 0.10, green: 0.14, blue: 0.18, alpha: 0.98)
-            : NSColor(calibratedRed: 0.88, green: 0.93, blue: 0.98, alpha: 0.98)
-        let badge = SpreadBadge(spreadText(), bg: bg, fg: palette.text, border: palette.border)
-        badge.fixedWidth(38)
-        badge.fixedHeight(18)
-        return badge
-    }
-
-    func spreadText() -> String {
-        guard let bid = displayBidPrice(), let ask = displayAskPrice(), ask >= bid else { return "--" }
-        return number2(ask - bid)
-    }
-
-    func orderSubmitTitle() -> String {
-        let action = orderSide == "BUY" ? "BUY" : "SELL"
-        if quoteSyncing {
-            return "WAITING FOR QUOTE\n\(selectedSymbol) OFFICIAL DATA"
-        }
-        if let orderId = editingOrderId {
-            return "MODIFY ORDER #\(orderId)\n\(orderQty) \(selectedSymbol) @ \(number2(orderEntryPrice()))"
-        }
-        if isOppositeOpenPositionOrder(side: orderSide) {
-            if orderType == "MARKET" {
-                return "CLOSE \(positionSideText())\n\(orderQty) \(selectedSymbol) MARKET · LIVE"
-            }
-            if tpEnabled || slEnabled {
-                return "PROTECT \(positionSideText())\n\(protectionSummaryText()) · \(min(orderQty, positionSizeText())) \(selectedSymbol)"
-            }
-            let entry = orderEntryPrice()
-            if isMarketableExitLimit(side: orderSide, price: entry) {
-                return "BLOCKED \(action)\nLIMIT WOULD FILL NOW"
-            }
-            return "TAKE PROFIT \(action)\n\(orderQty) \(selectedSymbol) @ \(number2(entry)) LIMIT · LIVE"
-        }
-        let type = orderType == "MARKET" ? "MARKET" : "LIMIT"
-        let prefix = liveTradingEnabled() ? "SEND" : "CHECK"
-        let suffix = liveTradingEnabled()
-            ? (apiClient?.config.sendBrackets == true ? "LIVE" : "LIVE · NO BRACKET")
-            : "READ ONLY"
-        let protection = protectionSummaryText()
-        if orderType == "LIMIT" {
-            return "\(prefix) \(action)\n\(orderQty) \(selectedSymbol) @ \(number2(orderEntryPrice())) \(type) · \(suffix) · \(protection)"
-        }
-        return "\(prefix) \(action)\n\(orderQty) \(selectedSymbol) \(type) · \(suffix)"
-    }
-
-    func liveTradingEnabled() -> Bool {
-        return apiClient?.config.readOnly == false
-    }
-
-    func protectionSummaryText() -> String {
-        if tpEnabled && slEnabled { return "TP/SL" }
-        if tpEnabled { return "TP ONLY" }
-        if slEnabled { return "SL ONLY" }
-        return "NO TP/SL"
-    }
-
-    func pair(_ name: String, _ value: String) -> NSView {
-        let row = hstack(spacing: 8)
-        row.addArrangedSubview(text(name, 9, .regular, palette.muted))
-        row.addArrangedSubview(digit(value, 11, .semibold, palette.text))
-        return row
-    }
-
-    func field(_ name: String, _ value: String) -> NSView {
-        let box = vstack(spacing: 3)
-        box.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        box.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        box.addArrangedSubview(text(name, 9, .regular, palette.muted))
-        let input = NSTextField(string: value)
-        input.cell = CenteredTextFieldCell(textCell: value)
-        input.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        input.textColor = palette.text
-        input.backgroundColor = inputBackgroundColor()
-        input.drawsBackground = true
-        input.isBezeled = false
-        input.wantsLayer = true
-        input.layer?.cornerRadius = 6
-        input.layer?.backgroundColor = inputBackgroundColor().cgColor
-        input.layer?.borderWidth = isDark ? 0 : 1
-        input.layer?.borderColor = alpha(palette.border, 0.75).cgColor
-        input.fixedHeight(26)
-        input.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        box.addArrangedSubview(input)
-        return box
-    }
-
-    func compactField(_ name: String, _ value: String, id: String? = nil, enabled: Bool = true) -> NSView {
-        let box = NSView()
-        let title = text(name, 8, .regular, enabled ? palette.muted : alpha(palette.muted, 0.55))
-        title.alignment = .center
-        let input = PriceInputTextField(string: value)
-        input.cell = CenteredTextFieldCell(textCell: value)
-        if let id {
-            input.identifier = NSUserInterfaceItemIdentifier(id)
-            input.delegate = self
-            input.target = self
-            input.action = #selector(ticketInputCommitted(_:))
-            input.onBegin = { [weak self] field in
-                self?.beginTicketInput(field)
-            }
-            input.onCommit = { [weak self] field in
-                guard let self, let id = field.identifier?.rawValue else { return }
-                self.activeTicketInput = nil
-                self.activeTicketField = nil
-                self.commitTicketInput(field, id: id)
-            }
-        }
-        input.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        input.textColor = enabled ? palette.text : alpha(palette.muted, 0.70)
-        input.alignment = .center
-        input.isEditable = enabled
-        input.isSelectable = enabled
-        input.isEnabled = enabled
-        input.backgroundColor = inputBackgroundColor()
-        input.drawsBackground = true
-        input.isBezeled = false
-        input.wantsLayer = true
-        input.layer?.cornerRadius = 6
-        input.layer?.backgroundColor = (enabled ? inputBackgroundColor() : alpha(inputBackgroundColor(), isDark ? 0.55 : 0.70)).cgColor
-        input.cell?.wraps = false
-        input.cell?.usesSingleLineMode = true
-        input.cell?.controlSize = .small
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: ""))
-        input.menu = menu
-        [title, input].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            box.addSubview($0)
-        }
-        NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: box.leadingAnchor),
-            title.trailingAnchor.constraint(equalTo: box.trailingAnchor),
-            title.topAnchor.constraint(equalTo: box.topAnchor),
-            input.leadingAnchor.constraint(equalTo: box.leadingAnchor),
-            input.trailingAnchor.constraint(equalTo: box.trailingAnchor),
-            input.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 3),
-            input.heightAnchor.constraint(equalToConstant: 24),
-            input.bottomAnchor.constraint(equalTo: box.bottomAnchor)
-        ])
-        return box
-    }
-
-    func zeroHeightView() -> NSView {
-        let view = NSView()
-        view.fixedHeight(0)
-        return view
-    }
-
-    func quantityControlRow(minus: NSButton, plus: NSButton) -> NSView {
-        let box = NSView()
-        box.fixedHeight(28)
-
-        let surface = NSView()
-        surface.wantsLayer = true
-        surface.layer?.cornerRadius = 6
-        surface.layer?.backgroundColor = inputBackgroundColor().cgColor
-
-        let qty = PriceInputTextField(string: "\(orderQty)")
-        qty.identifier = NSUserInterfaceItemIdentifier("orderQty")
-        qty.delegate = self
-        qty.target = self
-        qty.action = #selector(ticketInputCommitted(_:))
-        qty.onBegin = { [weak self] field in
-            self?.beginTicketInput(field)
-        }
-        qty.onCommit = { [weak self] field in
-            guard let self, let id = field.identifier?.rawValue else { return }
-            self.activeTicketInput = nil
-            self.activeTicketField = nil
-            self.commitTicketInput(field, id: id)
-        }
-        qty.cell = CenteredTextFieldCell(textCell: "\(orderQty)")
-        qty.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        qty.textColor = palette.text
-        qty.alignment = .center
-        qty.isEditable = true
-        qty.isSelectable = true
-        qty.isBezeled = false
-        qty.drawsBackground = false
-        qty.wantsLayer = true
-        qty.layer?.cornerRadius = 6
-        qty.cell?.wraps = false
-        qty.cell?.usesSingleLineMode = true
-        let symbol = text(selectedSymbol, 8, .medium, palette.muted)
-
-        [minus, plus].forEach {
-            $0.fixedHeight(24)
-            $0.fixedWidth(28)
-        }
-
-        [surface, qty, symbol, minus, plus].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            box.addSubview($0)
-        }
-
-        let controlWidth = max(CGFloat(70 + selectedSymbol.count * 8 + String(orderQty).count * 4), 82)
-        NSLayoutConstraint.activate([
-            surface.centerXAnchor.constraint(equalTo: box.centerXAnchor, constant: -34),
-            surface.widthAnchor.constraint(equalToConstant: controlWidth),
-            surface.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            surface.heightAnchor.constraint(equalToConstant: 24),
-
-            qty.leadingAnchor.constraint(equalTo: surface.leadingAnchor, constant: 8),
-            qty.trailingAnchor.constraint(equalTo: symbol.leadingAnchor, constant: -6),
-            qty.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
-            symbol.trailingAnchor.constraint(equalTo: surface.trailingAnchor, constant: -8),
-            symbol.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
-
-            minus.leadingAnchor.constraint(equalTo: surface.trailingAnchor, constant: 8),
-            minus.trailingAnchor.constraint(equalTo: plus.leadingAnchor, constant: -6),
-            minus.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
-            plus.centerYAnchor.constraint(equalTo: surface.centerYAnchor)
-        ])
-
-        return box
-    }
-
-    func quantityAndQuickQtyRow(minus: NSButton, plus: NSButton) -> NSView {
-        let box = NSView()
-        box.fixedHeight(30)
-
-        let surface = NSView()
-        surface.wantsLayer = true
-        surface.layer?.cornerRadius = 6
-        surface.layer?.backgroundColor = inputBackgroundColor().cgColor
-
-        let qty = quantityInputField()
-        let symbol = text(selectedSymbol, 8, .medium, palette.muted)
-
-        [minus, plus].forEach {
-            $0.fixedHeight(24)
-            $0.fixedWidth(24)
-        }
-
-        let row = NSView()
-        let quickRow = hstack(spacing: 4)
-        for value in [1, 3, 5, 10, 15] {
-            let selected = orderQty == value
-            let button = PillButton("\(value)", bg: selected ? alpha(palette.text, isDark ? 0.30 : 0.20) : alpha(palette.text, isDark ? 0.08 : 0.07), fg: selected ? palette.text : palette.muted, size: 9)
-            button.fixedWidth(24)
-            button.fixedHeight(24)
-            button.layer?.cornerRadius = 12
-            button.target = self
-            button.action = #selector(selectQuickQty(_:))
-            quickRow.addArrangedSubview(button)
-        }
-
-        row.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(row)
-        [surface, qty, symbol, minus, plus, quickRow].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            row.addSubview($0)
-        }
-
-        let controlWidth = min(max(CGFloat(66 + selectedSymbol.count * 5 + String(orderQty).count * 3), 70), 78)
-        NSLayoutConstraint.activate([
-            row.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-            row.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            row.widthAnchor.constraint(equalToConstant: 282),
-            row.heightAnchor.constraint(equalToConstant: 24),
-
-            surface.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            surface.widthAnchor.constraint(equalToConstant: controlWidth),
-            surface.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            surface.heightAnchor.constraint(equalToConstant: 24),
-
-            minus.leadingAnchor.constraint(equalTo: surface.trailingAnchor, constant: 4),
-            minus.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
-
-            plus.leadingAnchor.constraint(equalTo: minus.trailingAnchor, constant: 4),
-            plus.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
-
-            quickRow.leadingAnchor.constraint(equalTo: plus.trailingAnchor, constant: 8),
-            quickRow.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            quickRow.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
-
-            qty.leadingAnchor.constraint(equalTo: surface.leadingAnchor, constant: 8),
-            qty.trailingAnchor.constraint(equalTo: symbol.leadingAnchor, constant: -5),
-            qty.centerYAnchor.constraint(equalTo: surface.centerYAnchor),
-            symbol.trailingAnchor.constraint(equalTo: surface.trailingAnchor, constant: -7),
-            symbol.centerYAnchor.constraint(equalTo: surface.centerYAnchor)
-        ])
-
-        return box
-    }
-
-    func quantityInputField() -> PriceInputTextField {
-        let qty = PriceInputTextField(string: "\(orderQty)")
-        qty.identifier = NSUserInterfaceItemIdentifier("orderQty")
-        qty.delegate = self
-        qty.target = self
-        qty.action = #selector(ticketInputCommitted(_:))
-        qty.onBegin = { [weak self] field in
-            self?.beginTicketInput(field)
-        }
-        qty.onCommit = { [weak self] field in
-            guard let self, let id = field.identifier?.rawValue else { return }
-            self.activeTicketInput = nil
-            self.activeTicketField = nil
-            self.commitTicketInput(field, id: id)
-        }
-        qty.cell = CenteredTextFieldCell(textCell: "\(orderQty)")
-        qty.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        qty.textColor = palette.text
-        qty.alignment = .center
-        qty.isEditable = true
-        qty.isSelectable = true
-        qty.isBezeled = false
-        qty.drawsBackground = false
-        qty.wantsLayer = true
-        qty.layer?.cornerRadius = 6
-        qty.cell?.wraps = false
-        qty.cell?.usesSingleLineMode = true
-        return qty
-    }
-
-    func quickQtyRow() -> NSView {
-        let box = NSView()
-        box.fixedHeight(24)
-        let row = hstack(spacing: 7)
-        row.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(row)
-        for value in [1, 3, 5, 10, 15] {
-            let selected = orderQty == value
-            let button = PillButton("\(value)", bg: selected ? alpha(palette.text, isDark ? 0.30 : 0.20) : alpha(palette.text, isDark ? 0.08 : 0.07), fg: selected ? palette.text : palette.muted, size: 9)
-            button.fixedWidth(28)
-            button.fixedHeight(22)
-            button.layer?.cornerRadius = 11
-            button.target = self
-            button.action = #selector(selectQuickQty(_:))
-            row.addArrangedSubview(button)
-        }
-        NSLayoutConstraint.activate([
-            row.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-            row.topAnchor.constraint(equalTo: box.topAnchor),
-            row.bottomAnchor.constraint(equalTo: box.bottomAnchor)
-        ])
-        return box
-    }
-
-    func protectionRow() -> NSView {
-        let box = NSView()
-        box.fixedHeight(106)
-
-        let priceMode = PillButton("Price", bg: bracketMode == "PRICE" ? alpha(palette.blue, isDark ? 0.42 : 0.18) : palette.surface2, fg: bracketMode == "PRICE" ? palette.text : palette.muted, size: 8)
-        let ticks = PillButton("Ticks", bg: bracketMode == "TICKS" ? alpha(palette.blue, isDark ? 0.42 : 0.18) : palette.surface2, fg: bracketMode == "TICKS" ? palette.text : palette.muted, size: 8)
-        ticks.target = self
-        ticks.action = #selector(selectTicksMode)
-        priceMode.target = self
-        priceMode.action = #selector(selectPriceMode)
-        ticks.fixedWidth(52)
-        priceMode.fixedWidth(52)
-        ticks.fixedHeight(20)
-        priceMode.fixedHeight(20)
-
-        let modeControl = NSView()
-        modeControl.wantsLayer = true
-        modeControl.layer?.cornerRadius = 7
-        modeControl.layer?.backgroundColor = alpha(palette.surface2, isDark ? 0.72 : 0.90).cgColor
-
-        let priceProtectionReady = !(quoteSyncing && bracketMode == "PRICE")
-        let tpDisplayActive = tpEnabled || officialProtectionPrice(kind: "TP") != nil
-        let slDisplayActive = slEnabled || officialProtectionPrice(kind: "SL") != nil
-        let tp = compactField(bracketMode == "PRICE" ? "TP price" : "TP ticks", bracketValueText(kind: "TP"), id: "bracketTP", enabled: tpDisplayActive && priceProtectionReady)
-        let sl = compactField(bracketMode == "PRICE" ? "SL price" : "SL ticks", bracketValueText(kind: "SL"), id: "bracketSL", enabled: slDisplayActive && priceProtectionReady)
-        let tpCheck = protectionToggle(title: "TP", enabled: tpEnabled, action: #selector(toggleTPProtection))
-        let slCheck = protectionToggle(title: "SL", enabled: slEnabled, action: #selector(toggleSLProtection))
-        let fieldWidth = bracketInputWidth()
-        let tpPanel = protectionPanel(color: palette.green, active: tpEnabled)
-        let slPanel = protectionPanel(color: palette.red, active: slEnabled)
-        let tpHit = protectionPanelHitButton(panel: tpPanel, color: palette.green, active: tpEnabled, action: #selector(toggleTPProtection))
-        let slHit = protectionPanelHitButton(panel: slPanel, color: palette.red, active: slEnabled, action: #selector(toggleSLProtection))
-
-        [modeControl, tpPanel, slPanel, tpCheck, slCheck, tp, sl, tpHit, slHit].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            box.addSubview($0)
-        }
-        [priceMode, ticks].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            modeControl.addSubview($0)
-        }
-
-        NSLayoutConstraint.activate([
-            modeControl.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-            modeControl.topAnchor.constraint(equalTo: box.topAnchor),
-            modeControl.widthAnchor.constraint(equalToConstant: 110),
-            modeControl.heightAnchor.constraint(equalToConstant: 22),
-
-            priceMode.leadingAnchor.constraint(equalTo: modeControl.leadingAnchor, constant: 2),
-            priceMode.centerYAnchor.constraint(equalTo: modeControl.centerYAnchor),
-            ticks.leadingAnchor.constraint(equalTo: priceMode.trailingAnchor, constant: 2),
-            ticks.trailingAnchor.constraint(equalTo: modeControl.trailingAnchor, constant: -2),
-            ticks.centerYAnchor.constraint(equalTo: modeControl.centerYAnchor),
-
-            tpPanel.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 4),
-            tpPanel.trailingAnchor.constraint(equalTo: box.centerXAnchor, constant: -5),
-            tpPanel.topAnchor.constraint(equalTo: modeControl.bottomAnchor, constant: 9),
-            tpPanel.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -1),
-
-            slPanel.leadingAnchor.constraint(equalTo: box.centerXAnchor, constant: 5),
-            slPanel.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -4),
-            slPanel.topAnchor.constraint(equalTo: tpPanel.topAnchor),
-            slPanel.bottomAnchor.constraint(equalTo: tpPanel.bottomAnchor),
-
-            tpCheck.topAnchor.constraint(equalTo: tpPanel.topAnchor, constant: 10),
-            tpCheck.centerXAnchor.constraint(equalTo: tpPanel.centerXAnchor),
-            slCheck.centerXAnchor.constraint(equalTo: slPanel.centerXAnchor),
-            slCheck.centerYAnchor.constraint(equalTo: tpCheck.centerYAnchor),
-
-            tp.topAnchor.constraint(equalTo: tpCheck.bottomAnchor, constant: 6),
-            tp.centerXAnchor.constraint(equalTo: tpPanel.centerXAnchor),
-            tp.widthAnchor.constraint(equalToConstant: fieldWidth),
-            sl.centerXAnchor.constraint(equalTo: slPanel.centerXAnchor),
-            sl.topAnchor.constraint(equalTo: tp.topAnchor),
-            sl.widthAnchor.constraint(equalToConstant: fieldWidth),
-
-            tpHit.leadingAnchor.constraint(equalTo: tpPanel.leadingAnchor),
-            tpHit.trailingAnchor.constraint(equalTo: tpPanel.trailingAnchor),
-            tpHit.topAnchor.constraint(equalTo: tpPanel.topAnchor),
-            tpHit.bottomAnchor.constraint(equalTo: tp.topAnchor, constant: 13),
-
-            slHit.leadingAnchor.constraint(equalTo: slPanel.leadingAnchor),
-            slHit.trailingAnchor.constraint(equalTo: slPanel.trailingAnchor),
-            slHit.topAnchor.constraint(equalTo: slPanel.topAnchor),
-            slHit.bottomAnchor.constraint(equalTo: sl.topAnchor, constant: 13)
-        ])
-
-        return box
-    }
-
-    func protectionPanel(color: NSColor, active: Bool) -> NSView {
-        let panel = NSView()
-        panel.wantsLayer = true
-        panel.layer?.cornerRadius = 7
-        panel.layer?.backgroundColor = alpha(color, active ? (isDark ? 0.10 : 0.06) : (isDark ? 0.025 : 0.04)).cgColor
-        panel.layer?.borderWidth = 1
-        panel.layer?.borderColor = alpha(color, active ? 0.62 : 0.16).cgColor
-        return panel
-    }
-
-    func protectionPanelHitButton(panel: NSView, color: NSColor, active: Bool, action: Selector) -> HoverProxyButton {
-        let button = HoverProxyButton()
-        button.target = self
-        button.action = action
-        button.toolTip = active ? "Disable protection" : "Enable protection"
-
-        let normalBg = alpha(color, active ? (isDark ? 0.10 : 0.06) : (isDark ? 0.025 : 0.04))
-        let hoverBg = alpha(color, active ? (isDark ? 0.16 : 0.10) : (isDark ? 0.075 : 0.08))
-        let normalBorder = alpha(color, active ? 0.62 : 0.16)
-        let hoverBorder = alpha(color, active ? 0.88 : 0.42)
-
-        button.onHoverChanged = { [weak panel] hovering in
-            guard let layer = panel?.layer else { return }
-            CATransaction.begin()
-            CATransaction.setAnimationDuration(0.08)
-            layer.backgroundColor = (hovering ? hoverBg : normalBg).cgColor
-            layer.borderColor = (hovering ? hoverBorder : normalBorder).cgColor
-            CATransaction.commit()
-        }
-        return button
-    }
-
-    func bracketInputWidth() -> CGFloat {
-        let longest = max(bracketValueText(kind: "TP").count, bracketValueText(kind: "SL").count)
-        let raw = CGFloat(longest * 8 + 22)
-        return min(max(raw, bracketMode == "PRICE" ? 98 : 46), bracketMode == "PRICE" ? 108 : 56)
-    }
-
-    func protectionToggle(title: String, enabled: Bool, action: Selector) -> NSButton {
-        let button = NSButton(checkboxWithTitle: title, target: self, action: action)
-        button.state = enabled ? .on : .off
-        button.font = NSFont.systemFont(ofSize: 9, weight: .medium)
-        button.contentTintColor = enabled ? palette.text : palette.muted
-        button.setContentHuggingPriority(.required, for: .horizontal)
-        return button
-    }
-
-    @objc func toggleTPProtection() {
-        tpEnabled.toggle()
-        if bracketMode == "PRICE", tpEnabled {
-            tpPriceOverride = isOppositeOpenPositionOrder(side: orderSide) ? defaultPositionProtectionPrice(kind: "TP") : bracketPrice(kind: "TP")
-        }
-        rebuild(force: true)
-    }
-
-    @objc func toggleSLProtection() {
-        slEnabled.toggle()
-        if bracketMode == "PRICE", slEnabled {
-            slPriceOverride = isOppositeOpenPositionOrder(side: orderSide) ? defaultPositionProtectionPrice(kind: "SL") : bracketPrice(kind: "SL")
-        }
-        rebuild(force: true)
-    }
-
-    func bracketValueText(kind: String) -> String {
-        if quoteSyncing && bracketMode == "PRICE" {
-            return "--"
-        }
-        if bracketMode == "TICKS" {
-            return kind == "TP" ? "\(tpTicks)" : "\(slTicks)"
-        }
-        if kind == "TP", let value = tpPriceOverride {
-            return number2(value)
-        }
-        if kind == "SL", let value = slPriceOverride {
-            return number2(value)
-        }
-        if bracketMode == "PRICE", let official = officialProtectionPrice(kind: kind) {
-            return number2(official)
-        }
-        if isOppositeOpenPositionOrder(side: orderSide) {
-            return number2(positionProtectionPrice(kind: kind))
-        }
-        return number2(bracketPrice(kind: kind))
-    }
-
-    func officialProtectionOrder(kind: String) -> [String: Any]? {
-        guard let position = activePosition(),
-              let posContractId = position["contractId"] as? String else { return nil }
-        let posSide = positionSideText()
-        guard posSide == "LONG" || posSide == "SHORT" else { return nil }
-        let exitSide = posSide == "SHORT" ? "BUY" : "SELL"
-        let avg = numberValue(position["averagePrice"])
-        let candidates = workingOrders().filter { order in
-            guard (order["contractId"] as? String) == posContractId,
-                  orderSideText(order) == exitSide,
-                  let type = intValue(order["type"]),
-                  let price = officialProtectionOrderPrice(order, kind: kind) else { return false }
-            if kind == "TP" {
-                guard type == 1 else { return false }
-                if let avg {
-                    return posSide == "SHORT" ? price < avg : price > avg
-                }
-                return true
-            }
-            guard type == 3 || type == 4 || type == 5 else { return false }
-            if let avg {
-                return posSide == "SHORT" ? price > avg : price < avg
-            }
-            return true
-        }
-        return candidates.sorted {
-            let a = officialProtectionOrderPrice($0, kind: kind) ?? 0
-            let b = officialProtectionOrderPrice($1, kind: kind) ?? 0
-            if let avg {
-                return abs(a - avg) < abs(b - avg)
-            }
-            return (intValue($0["id"]) ?? 0) > (intValue($1["id"]) ?? 0)
-        }.first
-    }
-
-    func officialProtectionOrderPrice(_ order: [String: Any], kind: String) -> Double? {
-        if kind == "TP" {
-            return numberValue(order["limitPrice"]) ?? numberValue(order["stopPrice"]) ?? numberValue(order["trailPrice"])
-        }
-        return numberValue(order["stopPrice"]) ?? numberValue(order["limitPrice"]) ?? numberValue(order["trailPrice"])
-    }
-
-    func officialProtectionPrice(kind: String) -> Double? {
-        if kind == "TP", activeTicketInput == "bracketTP" { return nil }
-        if kind == "SL", activeTicketInput == "bracketSL" { return nil }
-        guard bracketMode == "PRICE" else { return nil }
-        if editingProtectionKind() == kind, let value = limitPriceOverride {
-            return value
-        }
-        guard let order = officialProtectionOrder(kind: kind) else { return nil }
-        return officialProtectionOrderPrice(order, kind: kind)
-    }
-
-    func editingProtectionKind() -> String? {
-        guard editingOrderId != nil,
-              let type = editingOrderType,
-              let side = editingOrderSide,
-              isOppositeOpenPositionOrder(side: side) else { return nil }
-        if type == 1 { return "TP" }
-        if type == 3 || type == 4 || type == 5 { return "SL" }
-        return nil
-    }
-
-    func bidPrice() -> Double {
-        return displayBidPrice() ?? max(0, price - contracts[selectedSymbol]!.tick)
-    }
-
-    func askPrice() -> Double {
-        return displayAskPrice() ?? price + contracts[selectedSymbol]!.tick
-    }
-
-    func displayBidPrice() -> Double? {
-        if quoteSyncing { return nil }
-        if let bestBidPrice {
-            return bestBidPrice
-        }
-        return marketStatusText == "Market Live" ? nil : max(0, price - contracts[selectedSymbol]!.tick)
-    }
-
-    func displayAskPrice() -> Double? {
-        if quoteSyncing { return nil }
-        if let bestAskPrice {
-            return bestAskPrice
-        }
-        return marketStatusText == "Market Live" ? nil : price + contracts[selectedSymbol]!.tick
-    }
-
-    func midPrice() -> Double? {
-        guard let bid = displayBidPrice(), let ask = displayAskPrice() else { return nil }
-        return (bid + ask) / 2
-    }
-
-    func marketEntryPrice() -> Double {
-        return orderSide == "BUY" ? askPrice() : bidPrice()
-    }
-
-    func orderEntryPrice() -> Double {
-        if orderType == "LIMIT", let value = limitPriceOverride {
-            return value
-        }
-        return marketEntryPrice()
-    }
-
-    func resetBracketPriceOverrides() {
-        guard !quoteSyncing else {
-            tpPriceOverride = nil
-            slPriceOverride = nil
-            return
-        }
-        if isOppositeOpenPositionOrder(side: orderSide) {
-            tpPriceOverride = defaultPositionProtectionPrice(kind: "TP")
-            slPriceOverride = defaultPositionProtectionPrice(kind: "SL")
-        } else {
-            tpPriceOverride = bracketPrice(kind: "TP")
-            slPriceOverride = bracketPrice(kind: "SL")
-        }
-    }
-
-    func bracketPrice(kind: String) -> Double {
-        let c = contracts[selectedSymbol]!
-        let tpOffset = Double(tpTicks) * c.tick
-        let slOffset = Double(slTicks) * c.tick
-        let entry = orderEntryPrice()
-        if kind == "TP" {
-            return orderSide == "BUY" ? entry + tpOffset : entry - tpOffset
-        }
-        return orderSide == "BUY" ? entry - slOffset : entry + slOffset
-    }
-
-    func parsedNumber(_ text: String) -> Double? {
-        return extractNumber(text)
-    }
-
-    func normalizedPrice(_ value: Double) -> Double {
-        let tick = contracts[selectedSymbol]!.tick
-        return (value / tick).rounded() * tick
-    }
-
-    func isTickAligned(_ value: Double) -> Bool {
-        abs(value - normalizedPrice(value)) < 0.000001
-    }
-
-    func isQuoteFresh(maxAge: TimeInterval = 5) -> Bool {
-        guard marketStatusText == "Market Live",
-              let lastQuoteAt,
-              displayBidPrice() != nil,
-              displayAskPrice() != nil else { return false }
-        return Date().timeIntervalSince(lastQuoteAt) <= maxAge
-    }
-
-    func jsonText(_ object: [String: Any]) -> String {
-        guard JSONSerialization.isValidJSONObject(object),
-              let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]),
-              let text = String(data: data, encoding: .utf8) else {
-            return "\(object)"
-        }
-        return text
-    }
+    // MARK: - Toasts / Sounds
 
     func setEvent(_ message: String, color: NSColor, detail: String? = nil) {
         eventLabel?.stringValue = message
@@ -5242,8 +2534,10 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return "\(sign)\(orderQty) \(selectedSymbol) \(side)"
     }
 
-    func showTradeToast(_ title: String, subtitle: String, color: NSColor) {
-        playToastSound(title: title, subtitle: subtitle)
+    func showTradeToast(_ title: String, subtitle: String, color: NSColor, playSound: Bool = true) {
+        if playSound {
+            playToastSound(title: title, subtitle: subtitle)
+        }
 
         guard let parent = window.contentView else { return }
 
@@ -5474,7 +2768,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 
     private func playSoundFile(_ kind: String) {
         guard let s = ensureSound(kind) else { return }
-        s.volume = 1.0
+        s.volume = 0.45
         s.stop()
         s.currentTime = 0
         s.play()
@@ -5498,7 +2792,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             if tpSound == nil {
                 if let url = soundURL(for: "TP"),
                    let s = NSSound(contentsOf: url, byReference: true) {
-                    s.volume = 1.0
+                    s.volume = 0.45
                     tpSound = s
                 }
             }
@@ -5513,7 +2807,7 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             if orderSound == nil {
                 if let url = soundURL(for: "Order"),
                    let s = NSSound(contentsOf: url, byReference: true) {
-                    s.volume = 1.0
+                    s.volume = 0.45
                     orderSound = s
                 }
             }
@@ -5526,6 +2820,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             return orderSound
         }
     }
+
+}
+
+extension PanelController {
+
+    // MARK: - Ticket Validation
 
     func shortTradeError(_ message: String) -> String {
         let lower = message.lowercased()
@@ -5576,160 +2876,14 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return max(0, Int((distance / c.tick).rounded()))
     }
 
-    func equalSplitRow(_ left: NSView, _ right: NSView, height: CGFloat, spacing: CGFloat = 2) -> NSView {
-        let row = NSView()
-        [left, right].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            row.addSubview($0)
-        }
-        NSLayoutConstraint.activate([
-            left.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            left.topAnchor.constraint(equalTo: row.topAnchor),
-            left.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            left.trailingAnchor.constraint(equalTo: row.centerXAnchor, constant: -spacing / 2),
-            right.leadingAnchor.constraint(equalTo: row.centerXAnchor, constant: spacing / 2),
-            right.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            right.topAnchor.constraint(equalTo: row.topAnchor),
-            right.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            row.heightAnchor.constraint(equalToConstant: height)
-        ])
-        row.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        row.setContentCompressionResistancePriority(.required, for: .horizontal)
-        return row
-    }
+}
+
+extension PanelController {
+
+    // MARK: - Ticket Misc UI
 
     func limitPriceRow() -> NSView {
-        let box = NSView()
-        box.fixedHeight(34)
-        let priceText = quoteSyncing ? "--" : number2(orderEntryPrice())
-        let priceFont = NSFont.monospacedDigitSystemFont(ofSize: adaptiveSize(for: priceText, base: 14, min: 12), weight: .semibold)
-        let inputWidth = limitPriceInputWidth(priceText, font: priceFont)
-
-        let title = text(editingOrderId == nil ? "LIMIT PRICE" : "ORDER PRICE", 10, .semibold, palette.muted)
-        title.alignment = .center
-        let row = NSView()
-        row.wantsLayer = true
-        row.layer?.cornerRadius = 7
-        row.layer?.backgroundColor = inputBackgroundColor().cgColor
-        row.layer?.borderWidth = 1
-        row.layer?.borderColor = palette.border.cgColor
-
-        let labelCell = NSView()
-        labelCell.wantsLayer = true
-        labelCell.layer?.backgroundColor = alpha(palette.surface2, isDark ? 0.72 : 0.90).cgColor
-
-        let control = NSView()
-        control.wantsLayer = true
-        control.layer?.backgroundColor = NSColor.clear.cgColor
-
-        let input = PriceInputTextField(string: priceText)
-        input.identifier = NSUserInterfaceItemIdentifier("limitPrice")
-        input.delegate = self
-        input.target = self
-        input.action = #selector(ticketInputCommitted(_:))
-        input.onBegin = { [weak self] field in
-            self?.beginTicketInput(field)
-        }
-        input.onCommit = { [weak self] field in
-            guard let self, let id = field.identifier?.rawValue else { return }
-            self.activeTicketInput = nil
-            self.activeTicketField = nil
-            self.commitTicketInput(field, id: id)
-        }
-        input.cell = CenteredTextFieldCell(textCell: input.stringValue)
-        input.font = priceFont
-        input.textColor = quoteSyncing ? alpha(palette.muted, 0.70) : palette.text
-        input.alignment = .center
-        input.isEditable = !quoteSyncing
-        input.isSelectable = !quoteSyncing
-        input.isEnabled = !quoteSyncing
-        input.backgroundColor = NSColor.clear
-        input.drawsBackground = false
-        input.isBezeled = false
-        input.wantsLayer = true
-        input.layer?.cornerRadius = 6
-        input.cell?.wraps = false
-        input.cell?.usesSingleLineMode = true
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: ""))
-        input.menu = menu
-
-        let up = PillButton("▲", bg: palette.surface2, fg: palette.text, size: 8)
-        let down = PillButton("▼", bg: palette.surface2, fg: palette.text, size: 8)
-        up.target = self
-        up.action = #selector(incrementLimitPrice)
-        down.target = self
-        down.action = #selector(decrementLimitPrice)
-        up.fixedWidth(24)
-        down.fixedWidth(24)
-        up.isEnabled = !quoteSyncing
-        down.isEnabled = !quoteSyncing
-
-        let stepper = vstack(spacing: 2)
-        stepper.addArrangedSubview(up)
-        stepper.addArrangedSubview(down)
-
-        let dividerLine = NSView()
-        dividerLine.wantsLayer = true
-        dividerLine.layer?.backgroundColor = palette.border.cgColor
-
-        row.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(row)
-        labelCell.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(labelCell)
-        [title, control].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            row.addSubview($0)
-        }
-        [input, dividerLine, stepper].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            control.addSubview($0)
-        }
-
-        NSLayoutConstraint.activate([
-            row.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-            row.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            row.widthAnchor.constraint(equalToConstant: 238),
-            row.heightAnchor.constraint(equalToConstant: 32),
-
-            labelCell.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            labelCell.topAnchor.constraint(equalTo: row.topAnchor),
-            labelCell.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            labelCell.widthAnchor.constraint(equalToConstant: 82),
-
-            title.leadingAnchor.constraint(equalTo: labelCell.leadingAnchor, constant: 5),
-            title.trailingAnchor.constraint(equalTo: labelCell.trailingAnchor, constant: -5),
-            title.centerYAnchor.constraint(equalTo: control.centerYAnchor),
-
-            control.leadingAnchor.constraint(equalTo: labelCell.trailingAnchor),
-            control.topAnchor.constraint(equalTo: row.topAnchor),
-            control.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            control.heightAnchor.constraint(equalToConstant: 32),
-            control.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-
-            input.leadingAnchor.constraint(equalTo: control.leadingAnchor, constant: 7),
-            input.topAnchor.constraint(equalTo: control.topAnchor),
-            input.bottomAnchor.constraint(equalTo: control.bottomAnchor),
-            input.widthAnchor.constraint(equalToConstant: inputWidth),
-
-            dividerLine.leadingAnchor.constraint(equalTo: input.trailingAnchor, constant: 4),
-            dividerLine.widthAnchor.constraint(equalToConstant: 1),
-            dividerLine.topAnchor.constraint(equalTo: control.topAnchor, constant: 5),
-            dividerLine.bottomAnchor.constraint(equalTo: control.bottomAnchor, constant: -5),
-
-            stepper.leadingAnchor.constraint(equalTo: dividerLine.trailingAnchor, constant: 4),
-            stepper.trailingAnchor.constraint(equalTo: control.trailingAnchor, constant: -4),
-            stepper.centerYAnchor.constraint(equalTo: control.centerYAnchor),
-
-            up.heightAnchor.constraint(equalToConstant: 13),
-            down.heightAnchor.constraint(equalToConstant: 13)
-        ])
-
-        return box
+        return LimitPriceRowView(owner: self)
     }
 
     func limitPriceInputWidth(_ value: String, font: NSFont) -> CGFloat {
@@ -5764,100 +2918,14 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
     }
 
-    func hstackText(_ items: [(String, NSColor)]) -> NSStackView {
-        let stack = hstack(spacing: 6)
-        stack.addArrangedSubview(spacer())
-        for (value, color) in items {
-            let isNumeric = value.contains("$") || value.contains(":") || value == "|"
-            stack.addArrangedSubview(isNumeric ? digit(value, 9, .semibold, color) : text(value, 9, .regular, color))
-        }
-        stack.addArrangedSubview(spacer())
-        return stack
-    }
+}
+
+extension PanelController {
+
+    // MARK: - Ticket Risk Summary
 
     func ticketRiskSummary() -> NSView {
-        let box = NSView()
-        let slActive = protectionDisplayActive(kind: "SL")
-        let tpActive = protectionDisplayActive(kind: "TP")
-        let slTicks = protectionDisplayTicks(kind: "SL")
-        let tpTicks = protectionDisplayTicks(kind: "TP")
-        let slAmount = protectionDisplaySignedAmount(kind: "SL")
-        let tpAmount = protectionDisplaySignedAmount(kind: "TP")
-
-        let sl = riskSummarySegment(
-            label: "SL",
-            value: slActive ? summarySignedAmountText(value: slAmount, ticks: slTicks) : "--",
-            valueColor: slActive ? (slAmount >= 0 ? palette.green : palette.red) : palette.muted,
-            valueWidth: 54,
-            valueAlignment: .center
-        )
-        let tp = riskSummarySegment(
-            label: "TP",
-            value: tpActive ? summarySignedAmountText(value: tpAmount, ticks: tpTicks) : "--",
-            valueColor: tpActive ? (tpAmount >= 0 ? palette.green : palette.red) : palette.muted,
-            valueWidth: 54,
-            valueAlignment: .center
-        )
-        let rr = riskSummarySegment(
-            label: "R:R",
-            value: rrCompactText(),
-            valueColor: tpActive && slActive && tpTicks > 0 ? palette.text : palette.muted,
-            valueWidth: 36,
-            valueAlignment: .center
-        )
-        let leftDivider = text("|", 10, .regular, palette.muted)
-        leftDivider.alignment = .center
-        let rightDivider = text("|", 10, .regular, palette.muted)
-        rightDivider.alignment = .center
-
-        [sl, tp, rr, leftDivider, rightDivider].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            box.addSubview($0)
-        }
-        NSLayoutConstraint.activate([
-            sl.leadingAnchor.constraint(equalTo: box.leadingAnchor),
-            sl.trailingAnchor.constraint(equalTo: leftDivider.leadingAnchor),
-            sl.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-
-            leftDivider.leadingAnchor.constraint(equalTo: sl.trailingAnchor),
-            leftDivider.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            leftDivider.widthAnchor.constraint(equalToConstant: 1),
-
-            tp.leadingAnchor.constraint(equalTo: leftDivider.trailingAnchor),
-            tp.trailingAnchor.constraint(equalTo: rightDivider.leadingAnchor),
-            tp.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            tp.widthAnchor.constraint(equalTo: sl.widthAnchor),
-
-            rightDivider.leadingAnchor.constraint(equalTo: tp.trailingAnchor),
-            rightDivider.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            rightDivider.widthAnchor.constraint(equalToConstant: 1),
-
-            rr.leadingAnchor.constraint(equalTo: rightDivider.trailingAnchor),
-            rr.trailingAnchor.constraint(equalTo: box.trailingAnchor),
-            rr.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            rr.widthAnchor.constraint(equalTo: sl.widthAnchor)
-        ])
-        return box
-    }
-
-    func riskSummarySegment(label: String, value: String, valueColor: NSColor, valueWidth: CGFloat, valueAlignment: NSTextAlignment) -> NSView {
-        let view = NSView()
-        let row = hstack(spacing: 4)
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.alignment = .centerY
-        view.addSubview(row)
-        let labelView = text(label, 10, .regular, palette.muted)
-        labelView.alignment = .left
-        labelView.fixedWidth(label == "R:R" ? 18 : 13)
-        row.addArrangedSubview(labelView)
-        row.addArrangedSubview(adaptiveDigit(value, base: 9, min: 6.5, weight: .semibold, color: valueColor, width: valueWidth, alignment: valueAlignment))
-        NSLayoutConstraint.activate([
-            row.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            row.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            row.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 2),
-            row.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -2)
-        ])
-        return view
+        return TicketRiskSummaryView(owner: self)
     }
 
     func summaryAmountText(value: Double, ticks: Int, sign: String) -> String {
@@ -5981,6 +3049,12 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         guard sl > 0, tp > 0 else { return "--" }
         return String(format: "%.2f", Double(tp) / Double(sl))
     }
+
+}
+
+extension PanelController {
+
+    // MARK: - Ticket Input Handling
 
     func beginTicketInput(_ field: NSTextField) {
         guard let id = field.identifier?.rawValue,
@@ -6129,117 +3203,4 @@ final class PanelController: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         return slTicks
     }
 
-    func fixedScaleLabels(left: String, middle: String, right: String) -> NSView {
-        let view = NSView()
-        let leftLabel = text(left, 9, .regular, palette.muted)
-        let middleLabel = text(middle, 9, .regular, palette.muted)
-        let rightLabel = text(right, 9, .regular, palette.muted)
-        [leftLabel, middleLabel, rightLabel].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview($0)
-        }
-        NSLayoutConstraint.activate([
-            leftLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            leftLabel.topAnchor.constraint(equalTo: view.topAnchor),
-            leftLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            middleLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            middleLabel.centerYAnchor.constraint(equalTo: leftLabel.centerYAnchor),
-            rightLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            rightLabel.centerYAnchor.constraint(equalTo: leftLabel.centerYAnchor)
-        ])
-        view.fixedHeight(12)
-        return view
-    }
-
-    func hstack(spacing: CGFloat = 6) -> NSStackView {
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.spacing = spacing
-        stack.alignment = .centerY
-        stack.distribution = .fill
-        return stack
-    }
-
-    func vstack(spacing: CGFloat = 6) -> NSStackView {
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.spacing = spacing
-        stack.alignment = .width
-        stack.distribution = .fill
-        return stack
-    }
-
-    func spacer() -> NSView {
-        let view = NSView()
-        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        return view
-    }
-
-    func divider() -> NSView {
-        let view = NSView()
-        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        view.wantsLayer = true
-        view.layer?.backgroundColor = palette.border.cgColor
-        view.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        return view
-    }
-
-    func shortDivider() -> NSView {
-        let view = NSView()
-        view.wantsLayer = true
-        view.layer?.backgroundColor = palette.border.cgColor
-        view.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        view.heightAnchor.constraint(equalToConstant: 12).isActive = true
-        return view
-    }
-
-    func card(_ content: NSView, pad: CGFloat = 6, color: NSColor? = nil) -> NSView {
-        let view = NSView()
-        view.wantsLayer = true
-        view.layer?.backgroundColor = (color ?? palette.surface).cgColor
-        view.layer?.cornerRadius = 8
-        view.layer?.borderWidth = 1
-        view.layer?.borderColor = palette.border.cgColor
-        content.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(content)
-        NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: pad),
-            content.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -pad),
-            content.topAnchor.constraint(equalTo: view.topAnchor, constant: pad),
-            content.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -pad)
-        ])
-        return view
-    }
-
-    func alpha(_ color: NSColor, _ value: CGFloat) -> NSColor {
-        return color.withAlphaComponent(value)
-    }
-
-    func clearSurface() -> NSColor {
-        return isDark ? NSColor(calibratedWhite: 0, alpha: 0.02) : NSColor(calibratedWhite: 1, alpha: 0.25)
-    }
-
-    func inputBackgroundColor() -> NSColor {
-        return isDark
-            ? NSColor(calibratedRed: 0.08, green: 0.08, blue: 0.08, alpha: 1)
-            : NSColor(calibratedRed: 0.93, green: 0.96, blue: 0.985, alpha: 1)
-    }
-
-    func readOnlyActionColor(_ color: NSColor) -> NSColor {
-        return isDark ? alpha(color, 0.45) : alpha(color, 0.22)
-    }
-
-    func readOnlyActionTextColor() -> NSColor {
-        return isDark ? NSColor.white : palette.text
-    }
 }
-
-let app = NSApplication.shared
-let delegate = PanelController()
-app.delegate = delegate
-
-// Default to regular app so it appears in Dock as running with standard right-click Quit menu.
-// Status item (top menu bar) still provides quick Quit for convenience with the floating panel.
-app.setActivationPolicy(.regular)
-app.run()
