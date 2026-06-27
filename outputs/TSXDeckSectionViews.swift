@@ -619,6 +619,8 @@ final class LimitPriceRowView: NSView {
 
         let up = PillButton("▲", bg: owner.palette.surface2, fg: owner.palette.text, size: 8)
         let down = PillButton("▼", bg: owner.palette.surface2, fg: owner.palette.text, size: 8)
+        up.hoverFeedback = false
+        down.hoverFeedback = false
         up.target = owner
         up.action = #selector(PanelController.incrementLimitPrice)
         down.target = owner
@@ -628,7 +630,7 @@ final class LimitPriceRowView: NSView {
         up.isEnabled = !owner.quoteSyncing
         down.isEnabled = !owner.quoteSyncing
 
-        let stepper = owner.vstack(spacing: 2)
+        let stepper = owner.vstack(spacing: 4)
         stepper.addArrangedSubview(up)
         stepper.addArrangedSubview(down)
 
@@ -684,8 +686,8 @@ final class LimitPriceRowView: NSView {
             stepper.trailingAnchor.constraint(equalTo: control.trailingAnchor, constant: -4),
             stepper.centerYAnchor.constraint(equalTo: control.centerYAnchor),
 
-            up.heightAnchor.constraint(equalToConstant: 13),
-            down.heightAnchor.constraint(equalToConstant: 13)
+            up.heightAnchor.constraint(equalToConstant: 12),
+            down.heightAnchor.constraint(equalToConstant: 12)
         ])
     }
 }

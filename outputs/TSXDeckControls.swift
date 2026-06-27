@@ -42,6 +42,7 @@ final class PillButton: NSButton {
     var bgColor = NSColor.clear
     var fgColor = NSColor.white
     var visualFeedback = true
+    var hoverFeedback = true
 
     private var trackingArea: NSTrackingArea?
     private var hovered = false
@@ -148,7 +149,7 @@ final class PillButton: NSButton {
         } else if pressed {
             targetBg = bgColor.blended(withFraction: 0.38, of: NSColor.black) ?? bgColor
             targetTint = fgColor.withAlphaComponent(0.82)
-        } else if hovered {
+        } else if hovered && hoverFeedback {
             if lowAlpha {
                 targetBg = bgColor
                 targetTint = fgColor.withAlphaComponent(0.85)
@@ -198,7 +199,7 @@ final class PillButton: NSButton {
             self.contentTintColor = targetTint
         }
 
-        if visualFeedback && hovered && !lowAlpha {
+        if visualFeedback && hoverFeedback && hovered && !lowAlpha {
             layer.borderWidth = 1
             layer.borderColor = fgColor.withAlphaComponent(0.3).cgColor
         } else if !hovered {
